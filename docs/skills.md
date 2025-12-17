@@ -39,7 +39,9 @@ Skills are behind the experimental `skills` feature flag and are disabled by def
 ## Using skills
 
 - Mention a skill by name in a message using `$<skill-name>`.
+- When a skill is mentioned, Codex loads that skill’s `SKILL.md` contents and injects it into the model context for that turn.
 - In the TUI, you can also use `/skills` to browse and insert skills.
+- Skills can also be injected into subagents via the `delegate` tool (see [docs/subagents.md](./subagents.md)).
 
 ## Validation and errors
 

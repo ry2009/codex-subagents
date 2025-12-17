@@ -8,3 +8,8 @@ Codex CLI is an experimental project under active development. It is not yet sta
 - Good vibes
 
 Help us improve by filing issues or submitting PRs (see [docs/contributing.md](docs/contributing.md) for guidance)!
+
+### Experimental features
+
+- Skills: see [docs/skills.md](docs/skills.md)
+- Subagents: see [docs/subagents.md](docs/subagents.md)

@@ -50,11 +50,37 @@ Supported features:
 | `enable_experimental_windows_sandbox` |  false  | Experimental | Use the Windows restricted-token sandbox              |
 | `tui2`                                |  false  | Experimental | Use the experimental TUI v2 (viewport) implementation |
 | `skills`                              |  false  | Experimental | Enable discovery and injection of skills              |
+| `subagents`                           |  false  | Experimental | Enable subagent tools (`delegate`, `subagent_*`)      |
 
 Notes:
 
 - Omit a key to accept its default.
 - Legacy booleans such as `experimental_use_exec_command_tool`, `experimental_use_unified_exec_tool`, `include_apply_patch_tool`, and similar `experimental_use_*` keys are deprecated; setting the corresponding `[features].<key>` avoids repeated warnings.
+
+## Subagents
+
+When the `subagents` feature is enabled, you can tune subagent orchestration budgets via a `[subagents]` table in `$CODEX_HOME/config.toml`:
+
+```toml
+[subagents]
+# When unset, Codex picks a conservative default based on CPU cores.
+max_concurrency = 4
+
+# Cap the number of tracked subagents; older completed agents are pruned first.
+max_agents = 128
+
+# Default timeout for background subagents (subagent_spawn/subagent_resume) when timeout_ms is omitted.
+default_timeout_ms = 1800000 # 30 minutes
+
+# Time budget for built-in orchestration (/plan, /solve) and the default delegate timeout.
+# Orchestration runs in explore mode with tool-heavy features disabled to avoid approval deadlocks.
+orchestration_timeout_ms = 180000 # 3 minutes
+
+# Output budgeting for subagent status/event reporting.
+max_events = 64
+max_event_chars = 2048
+max_output_chars = 32768
+```
 
 ## Model selection
 
