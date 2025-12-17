@@ -168,9 +168,7 @@ fn sanitize_prompt(mut prompt: String) -> String {
 
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
     let mut segments = content.split_inclusive('\n');
-    let Some(first_segment) = segments.next() else {
-        return None;
-    };
+    let first_segment = segments.next()?;
     let first_line = first_segment.trim_end_matches(['\r', '\n']);
     if first_line.trim() != "---" {
         return None;
