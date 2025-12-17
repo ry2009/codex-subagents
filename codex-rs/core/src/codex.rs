@@ -2571,9 +2571,7 @@ mod handlers {
             let has_active_turn = { parent_session.active_turn.lock().await.is_some() };
             let msg = if has_active_turn {
                 EventMsg::Warning(WarningEvent {
-                    message: format!(
-                        "{report}\n(use `/subagents` for rollout paths and logs)"
-                    ),
+                    message: format!("{report}\n(use `/subagents` for rollout paths and logs)"),
                 })
             } else {
                 EventMsg::AgentMessage(codex_protocol::protocol::AgentMessageEvent {
@@ -2781,9 +2779,7 @@ mod handlers {
             let has_active_turn = { parent_session.active_turn.lock().await.is_some() };
             let msg = if has_active_turn {
                 EventMsg::Warning(WarningEvent {
-                    message: format!(
-                        "{report}\n(use `/subagents` for rollout paths and logs)"
-                    ),
+                    message: format!("{report}\n(use `/subagents` for rollout paths and logs)"),
                 })
             } else {
                 EventMsg::AgentMessage(codex_protocol::protocol::AgentMessageEvent {
