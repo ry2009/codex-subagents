@@ -524,6 +524,7 @@ impl Session {
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
             features: &per_turn_config.features,
+            tool_name_allowlist: per_turn_config.tool_name_allowlist.as_deref(),
         });
 
         TurnContext {
@@ -1678,6 +1679,9 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::ListCustomPrompts => {
                 handlers::list_custom_prompts(&sess, sub.id.clone()).await;
             }
+            Op::ListCustomAgents => {
+                handlers::list_custom_agents(&sess, &config, sub.id.clone()).await;
+            }
             Op::ListSkills { cwds } => {
                 handlers::list_skills(&sess, sub.id.clone(), cwds).await;
             }
@@ -1695,6 +1699,14 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             }
             Op::OrchestrateSolve { prompt } => {
                 handlers::orchestrate_solve(&sess, sub.id.clone(), prompt);
+            }
+            Op::RunCustomAgent {
+                name,
+                prompt,
+                wait,
+                timeout_ms,
+            } => {
+                handlers::run_custom_agent(&sess, sub.id.clone(), name, prompt, wait, timeout_ms);
             }
             Op::Undo => {
                 handlers::undo(&sess, sub.id.clone()).await;
@@ -1755,6 +1767,7 @@ mod handlers {
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ListCustomAgentsResponseEvent;
     use codex_protocol::protocol::ListCustomPromptsResponseEvent;
     use codex_protocol::protocol::ListSkillsResponseEvent;
     use codex_protocol::protocol::ListSubagentsResponseEvent;
@@ -2016,6 +2029,30 @@ mod handlers {
         sess.send_event_raw(event).await;
     }
 
+    pub async fn list_custom_agents(sess: &Session, config: &Arc<Config>, sub_id: String) {
+        let cwd = {
+            let state = sess.state.lock().await;
+            state.session_configuration.cwd.clone()
+        };
+        let mut cfg = config.as_ref().clone();
+        cfg.cwd = cwd;
+
+        let enabled = sess.enabled(Feature::Subagents);
+        let outcome = crate::custom_agents::discover_agents(&cfg).await;
+        let agents = super::custom_agents_to_info(&outcome.agents);
+        let errors = super::custom_agent_errors_to_info(&outcome.errors);
+
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::ListCustomAgentsResponse(ListCustomAgentsResponseEvent {
+                enabled,
+                agents,
+                errors,
+            }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
     pub async fn list_skills(sess: &Session, sub_id: String, cwds: Vec<PathBuf>) {
         let cwds = if cwds.is_empty() {
             let state = sess.state.lock().await;
@@ -2051,6 +2088,235 @@ mod handlers {
             msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }),
         };
         sess.send_event_raw(event).await;
+    }
+
+    pub fn run_custom_agent(
+        sess: &Arc<Session>,
+        sub_id: String,
+        name: String,
+        prompt: String,
+        wait: bool,
+        timeout_ms: Option<u64>,
+    ) {
+        let parent_session = Arc::clone(sess);
+        tokio::spawn(async move {
+            if !parent_session.enabled(Feature::Subagents) {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "subagents feature is disabled (enable with `--enable subagents`)"
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let Some(agent_name) = super::sanitize_custom_agent_query(&name) else {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "agent name must be non-empty".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            };
+
+            let task = prompt.trim().to_string();
+            if task.is_empty() {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "agent prompt must be non-empty".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let parent_turn = parent_session
+                .new_turn(SessionSettingsUpdate::default())
+                .await;
+            let parent_config = parent_turn.client.config().as_ref().clone();
+
+            let outcome = crate::custom_agents::discover_agents(&parent_config).await;
+            let agent = outcome
+                .agents
+                .iter()
+                .find(|agent| agent.name == agent_name)
+                .cloned();
+            let Some(agent) = agent else {
+                let known = outcome
+                    .agents
+                    .iter()
+                    .map(|agent| agent.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let message = if known.is_empty() {
+                    format!("unknown agent `{agent_name}` (no agents discovered)")
+                } else {
+                    format!("unknown agent `{agent_name}` (available: {known})")
+                };
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message,
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            };
+
+            let auth_manager = parent_session.services.auth_manager.clone();
+            let models_manager = parent_session.services.models_manager.clone();
+            let skills_manager = parent_session.services.skills_manager.clone();
+            let subagent_manager = parent_session.services.subagent_manager.clone();
+
+            let agent_label = agent.name.clone();
+            let mut subagent_config = parent_config.clone();
+            if let Some(model) = agent.model.as_ref() {
+                subagent_config.model = Some(model.clone());
+            }
+            subagent_config.tool_name_allowlist =
+                super::agent_tools_policy_to_allowlist(&agent.tools);
+
+            let agent_prompt = agent.prompt.trim();
+            if !agent_prompt.is_empty() {
+                subagent_config.developer_instructions =
+                    Some(match subagent_config.developer_instructions.take() {
+                        Some(existing) => {
+                            format!("{existing}\n\n# Custom agent: {agent_label}\n\n{agent_prompt}")
+                        }
+                        None => format!("# Custom agent: {agent_label}\n\n{agent_prompt}"),
+                    });
+            }
+
+            let mode = agent
+                .mode
+                .unwrap_or(crate::subagents::SubagentMode::Explore);
+
+            let resp = subagent_manager
+                .spawn_one_shot(
+                    crate::subagents::SubagentSpawnRequest {
+                        agent_id: None,
+                        mode,
+                        label: agent.name.clone(),
+                        prompt: task,
+                        skills: Vec::new(),
+                        timeout_ms,
+                        resume_rollout_path: None,
+                    },
+                    Arc::clone(&parent_session),
+                    Arc::clone(&parent_turn),
+                    auth_manager,
+                    models_manager,
+                    skills_manager,
+                    subagent_config.clone(),
+                )
+                .await;
+
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(e) => {
+                    let event = Event {
+                        id: sub_id,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: format!("failed to spawn agent `{agent_label}`: {e}"),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    };
+                    parent_session.send_event_raw(event).await;
+                    return;
+                }
+            };
+
+            let agent_id = resp.agent_id.clone();
+            let started = Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Started custom agent `{agent_label}`.\n\nAgent id: {agent_id}\n\nUse `/subagents` to inspect/cancel."
+                    ),
+                }),
+            };
+            parent_session.send_event_raw(started).await;
+
+            if !wait {
+                return;
+            }
+
+            let wait_timeout = timeout_ms
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(subagent_config.subagents.default_timeout);
+            let deadline = std::time::Instant::now() + wait_timeout;
+
+            let poll = loop {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or(std::time::Duration::ZERO);
+                if remaining.is_zero() {
+                    let event = Event {
+                        id: sub_id,
+                        msg: EventMsg::Warning(WarningEvent {
+                            message: format!(
+                                "Custom agent `{agent_label}` is still running.\n\nAgent id: {agent_id}\n\nUse `/subagents` to poll/cancel."
+                            ),
+                        }),
+                    };
+                    parent_session.send_event_raw(event).await;
+                    return;
+                }
+                let await_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                let Some(poll) = subagent_manager.poll(&agent_id, Some(await_ms)).await else {
+                    let event = Event {
+                        id: sub_id,
+                        msg: EventMsg::Error(ErrorEvent {
+                            message: "unknown agent_id".to_string(),
+                            codex_error_info: Some(CodexErrorInfo::Other),
+                        }),
+                    };
+                    parent_session.send_event_raw(event).await;
+                    return;
+                };
+
+                if !matches!(
+                    poll.status,
+                    crate::subagents::SubagentStatus::Queued
+                        | crate::subagents::SubagentStatus::Running
+                ) {
+                    break poll;
+                }
+            };
+
+            let max_output_chars = subagent_config.subagents.max_output_chars;
+            let output = poll
+                .final_output
+                .map(|text| super::cap_string(text, max_output_chars))
+                .or_else(|| {
+                    let joined = poll.recent_events.join("\n");
+                    if joined.trim().is_empty() {
+                        None
+                    } else {
+                        Some(super::cap_string(joined, max_output_chars))
+                    }
+                })
+                .unwrap_or_else(|| "(no output)".to_string());
+
+            let message = format!("Custom agent `{agent_label}` result:\n\n{output}");
+            parent_session
+                .send_event_raw(Event {
+                    id: sub_id,
+                    msg: EventMsg::AgentMessage(codex_protocol::protocol::AgentMessageEvent {
+                        message,
+                    }),
+                })
+                .await;
+        });
     }
 
     pub async fn list_subagents(sess: &Session, sub_id: String) {
@@ -2240,7 +2506,7 @@ mod handlers {
                 id: sub_id.clone(),
                 msg: EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Started multi-agent plan (experimental).\n\nUse `/subagents` (default TUI) to inspect/cancel.\n\n{started_message}"
+                        "Started multi-agent plan (experimental).\n\nUse `/subagents` to inspect/cancel.\n\n{started_message}"
                     ),
                 }),
             };
@@ -2306,7 +2572,7 @@ mod handlers {
             let msg = if has_active_turn {
                 EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "{report}\n(use `/subagents` (default TUI) for rollout paths and logs)"
+                        "{report}\n(use `/subagents` for rollout paths and logs)"
                     ),
                 })
             } else {
@@ -2450,7 +2716,7 @@ mod handlers {
                 id: sub_id.clone(),
                 msg: EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "Started multi-agent solve (experimental).\n\nUse `/subagents` (default TUI) to inspect/cancel.\n\n{started_message}"
+                        "Started multi-agent solve (experimental).\n\nUse `/subagents` to inspect/cancel.\n\n{started_message}"
                     ),
                 }),
             };
@@ -2516,7 +2782,7 @@ mod handlers {
             let msg = if has_active_turn {
                 EventMsg::Warning(WarningEvent {
                     message: format!(
-                        "{report}\n(use `/subagents` (default TUI) for rollout paths and logs)"
+                        "{report}\n(use `/subagents` for rollout paths and logs)"
                     ),
                 })
             } else {
@@ -2655,6 +2921,7 @@ async fn spawn_review_thread(
     let tools_config = ToolsConfig::new(&ToolsConfigParams {
         model_family: &review_model_family,
         features: &review_features,
+        tool_name_allowlist: config.tool_name_allowlist.as_deref(),
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -2733,6 +3000,101 @@ fn skills_to_info(skills: &[SkillMetadata]) -> Vec<ProtocolSkillMetadata> {
             scope: skill.scope,
         })
         .collect()
+}
+
+fn sanitize_custom_agent_query(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for ch in trimmed.chars() {
+        if out.len() >= 64 {
+            break;
+        }
+        match ch {
+            'a'..='z' | '0'..='9' | '-' | '_' => out.push(ch),
+            'A'..='Z' => out.push(ch.to_ascii_lowercase()),
+            ' ' | '/' | ':' => out.push('-'),
+            _ => {}
+        }
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn agent_tools_policy_to_allowlist(
+    policy: &crate::custom_agents::AgentToolsPolicy,
+) -> Option<Vec<String>> {
+    match policy {
+        crate::custom_agents::AgentToolsPolicy::Inherit => None,
+        crate::custom_agents::AgentToolsPolicy::None => Some(Vec::new()),
+        crate::custom_agents::AgentToolsPolicy::Allowlist(names) => Some(names.clone()),
+    }
+}
+
+fn custom_agents_to_info(
+    agents: &[crate::custom_agents::CustomAgent],
+) -> Vec<codex_protocol::protocol::CustomAgentMetadata> {
+    agents
+        .iter()
+        .map(|agent| {
+            let (tools_policy, allowed_tools) = match &agent.tools {
+                crate::custom_agents::AgentToolsPolicy::Inherit => (
+                    codex_protocol::protocol::CustomAgentToolsPolicy::Inherit,
+                    Vec::new(),
+                ),
+                crate::custom_agents::AgentToolsPolicy::None => (
+                    codex_protocol::protocol::CustomAgentToolsPolicy::None,
+                    Vec::new(),
+                ),
+                crate::custom_agents::AgentToolsPolicy::Allowlist(names) => (
+                    codex_protocol::protocol::CustomAgentToolsPolicy::Allowlist,
+                    names.clone(),
+                ),
+            };
+
+            let scope = match agent.scope {
+                crate::custom_agents::AgentScope::User => {
+                    codex_protocol::protocol::CustomAgentScope::User
+                }
+                crate::custom_agents::AgentScope::Repo => {
+                    codex_protocol::protocol::CustomAgentScope::Repo
+                }
+            };
+
+            codex_protocol::protocol::CustomAgentMetadata {
+                name: agent.name.clone(),
+                description: agent.description.clone(),
+                path: agent.path.clone(),
+                scope,
+                model: agent.model.clone(),
+                mode: agent.mode.map(subagent_mode_to_info),
+                tools_policy,
+                allowed_tools,
+            }
+        })
+        .collect()
+}
+
+fn custom_agent_errors_to_info(
+    errors: &[crate::custom_agents::AgentLoadError],
+) -> Vec<codex_protocol::protocol::CustomAgentErrorInfo> {
+    errors
+        .iter()
+        .map(|err| codex_protocol::protocol::CustomAgentErrorInfo {
+            path: err.path.clone(),
+            message: err.message.clone(),
+        })
+        .collect()
+}
+
+fn cap_string(mut text: String, max_bytes: usize) -> String {
+    if text.len() > max_bytes {
+        text = codex_utils_string::take_bytes_at_char_boundary(&text, max_bytes).to_string();
+    }
+    text
 }
 
 fn subagent_mode_to_info(

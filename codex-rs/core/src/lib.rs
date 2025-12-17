@@ -20,6 +20,7 @@ mod command_safety;
 pub mod config;
 pub mod config_loader;
 mod context_manager;
+mod custom_agents;
 pub mod custom_prompts;
 pub mod env;
 mod environment_context;

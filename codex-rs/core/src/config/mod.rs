@@ -282,6 +282,12 @@ pub struct Config {
     /// Centralized feature flags; source of truth for feature gating.
     pub features: Features,
 
+    /// Optional allowlist restricting which tools are exposed to the model.
+    ///
+    /// This is intended for internal flows (e.g. custom agents) that need to
+    /// enforce a narrower tool surface than the parent session.
+    pub(crate) tool_name_allowlist: Option<Vec<String>>,
+
     /// Subagent orchestration and budgeting settings.
     pub subagents: SubagentsConfig,
 
@@ -1279,6 +1285,7 @@ impl Config {
             use_experimental_use_rmcp_client,
             ghost_snapshot,
             features,
+            tool_name_allowlist: None,
             subagents,
             active_profile: active_profile_name,
             active_project,
@@ -3056,6 +3063,7 @@ model_verbosity = "high"
                 use_experimental_use_rmcp_client: false,
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
+                tool_name_allowlist: None,
                 subagents: default_subagents_config(),
                 active_profile: Some("o3".to_string()),
                 active_project: ProjectConfig { trust_level: None },
@@ -3132,6 +3140,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            tool_name_allowlist: None,
             subagents: default_subagents_config(),
             active_profile: Some("gpt3".to_string()),
             active_project: ProjectConfig { trust_level: None },
@@ -3223,6 +3232,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            tool_name_allowlist: None,
             subagents: default_subagents_config(),
             active_profile: Some("zdr".to_string()),
             active_project: ProjectConfig { trust_level: None },
@@ -3300,6 +3310,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            tool_name_allowlist: None,
             subagents: default_subagents_config(),
             active_profile: Some("gpt5".to_string()),
             active_project: ProjectConfig { trust_level: None },

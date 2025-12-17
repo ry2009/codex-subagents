@@ -79,6 +79,7 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::McpStartupUpdate(_)
         | EventMsg::McpStartupComplete(_)
         | EventMsg::ListCustomPromptsResponse(_)
+        | EventMsg::ListCustomAgentsResponse(_)
         | EventMsg::ListSkillsResponse(_)
         | EventMsg::ListSubagentsResponse(_)
         | EventMsg::PollSubagentResponse(_)
