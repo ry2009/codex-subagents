@@ -15,6 +15,8 @@ pub enum SlashCommand {
     Model,
     Approvals,
     Skills,
+    Agents,
+    Agent,
     Subagents,
     Review,
     Plan,
@@ -53,6 +55,8 @@ impl SlashCommand {
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
+            SlashCommand::Agents => "list available custom agents",
+            SlashCommand::Agent => "run a custom agent as a background subagent",
             SlashCommand::Subagents => "manage background subagents for this session",
             SlashCommand::Status => "show current session configuration and token usage",
             SlashCommand::Model => "choose what model and reasoning effort to use",
@@ -71,7 +75,10 @@ impl SlashCommand {
     }
 
     pub fn accepts_args(self) -> bool {
-        matches!(self, SlashCommand::Plan | SlashCommand::Solve)
+        matches!(
+            self,
+            SlashCommand::Plan | SlashCommand::Solve | SlashCommand::Agent
+        )
     }
 
     /// Whether this command can be run while a task is in progress.
@@ -87,10 +94,12 @@ impl SlashCommand {
             | SlashCommand::Review
             | SlashCommand::Plan
             | SlashCommand::Solve
+            | SlashCommand::Agent
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::Mention
             | SlashCommand::Skills
+            | SlashCommand::Agents
             | SlashCommand::Subagents
             | SlashCommand::Status
             | SlashCommand::Mcp

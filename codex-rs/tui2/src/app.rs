@@ -1419,6 +1419,18 @@ impl App {
                 }
                 tui.frame_requester().schedule_frame();
             }
+            AppEvent::OpenSubagentsPopup => {
+                self.chat_widget.open_subagents_popup();
+            }
+            AppEvent::OpenSubagentActions {
+                agent_id,
+                label,
+                mode,
+                status,
+            } => {
+                self.chat_widget
+                    .open_subagent_actions_popup(agent_id, label, mode, status);
+            }
             AppEvent::OpenResumePicker => {
                 match crate::resume_picker::run_resume_picker(
                     tui,

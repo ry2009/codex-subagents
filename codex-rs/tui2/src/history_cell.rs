@@ -26,10 +26,16 @@ use base64::Engine;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
+use codex_core::protocol::CustomAgentScope;
+use codex_core::protocol::CustomAgentToolsPolicy;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::ListCustomAgentsResponseEvent;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
+use codex_core::protocol::SubagentDetail;
+use codex_core::protocol::SubagentMode;
+use codex_core::protocol::SubagentStatus;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_protocol::plan_tool::PlanItemArg;
@@ -1285,6 +1291,117 @@ pub(crate) fn new_mcp_tools_output(
 
     PlainHistoryCell { lines }
 }
+
+pub(crate) fn new_custom_agents_output(ev: ListCustomAgentsResponseEvent) -> PlainHistoryCell {
+    let ListCustomAgentsResponseEvent {
+        enabled,
+        agents,
+        errors,
+    } = ev;
+
+    let mut lines: Vec<Line<'static>> = vec![
+        "/agents".magenta().into(),
+        "".into(),
+        vec!["🤖  ".into(), "Custom Agents".bold()].into(),
+        vec![
+            "Define agents in ".dim(),
+            "`.codex/agents/*.md`".dim(),
+            " or ".dim(),
+            "`$CODEX_HOME/agents/*.md`".dim(),
+            ".".dim(),
+        ]
+        .into(),
+        "".into(),
+    ];
+
+    if !enabled {
+        lines.push(
+            "  • Subagents are disabled (enable with `--enable subagents` or `[features] subagents = true`)."
+                .italic()
+                .into(),
+        );
+        lines.push("".into());
+    }
+
+    if agents.is_empty() {
+        lines.push("  • No custom agents found.".italic().into());
+        lines.push("".into());
+        return PlainHistoryCell { lines };
+    }
+
+    for agent in agents {
+        let scope = match agent.scope {
+            CustomAgentScope::User => "user",
+            CustomAgentScope::Repo => "repo",
+        };
+        lines.push(
+            vec![
+                "  • ".into(),
+                agent.name.bold(),
+                " ".into(),
+                format!("({scope})").dim(),
+            ]
+            .into(),
+        );
+        if let Some(description) = agent.description {
+            lines.push(vec!["    • ".dim(), description.into()].into());
+        }
+        if let Some(model) = agent.model {
+            lines.push(vec!["    • Model: ".dim(), model.into()].into());
+        }
+        if let Some(mode) = agent.mode {
+            let mode_str = match mode {
+                SubagentMode::Explore => "explore",
+                SubagentMode::General => "general",
+            };
+            lines.push(vec!["    • Mode: ".dim(), mode_str.into()].into());
+        }
+
+        let tools_policy = match agent.tools_policy {
+            CustomAgentToolsPolicy::Inherit => "inherit",
+            CustomAgentToolsPolicy::None => "none",
+            CustomAgentToolsPolicy::Allowlist => "allowlist",
+        };
+        let mut tools_line: Vec<Span<'static>> = vec!["    • Tools: ".dim(), tools_policy.into()];
+        if !agent.allowed_tools.is_empty() {
+            tools_line.push(" ".into());
+            tools_line.push(format!("({})", agent.allowed_tools.join(", ")).dim());
+        }
+        lines.push(tools_line.into());
+
+        lines.push(vec!["    • Path: ".dim(), agent.path.display().to_string().dim()].into());
+
+        lines.push(Line::from(""));
+    }
+
+    lines.push(
+        vec![
+            "Run: ".dim(),
+            "`/agent <name> <task>`".cyan(),
+            " (spawns a background subagent)".dim(),
+        ]
+        .into(),
+    );
+
+    if !errors.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(vec!["⚠️  ".into(), "Errors".bold()].into());
+        for err in errors {
+            lines.push(
+                vec![
+                    "  • ".dim(),
+                    err.path.display().to_string().into(),
+                    ": ".dim(),
+                    err.message.into(),
+                ]
+                .into(),
+            );
+        }
+    }
+
+    PlainHistoryCell { lines }
+}
+
 pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHistoryCell {
     let mut line = vec!["• ".dim(), message.into()];
     if let Some(hint) = hint {
@@ -1292,6 +1409,87 @@ pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHist
         line.push(hint.dark_gray());
     }
     let lines: Vec<Line<'static>> = vec![line.into()];
+    PlainHistoryCell { lines }
+}
+
+pub(crate) fn new_subagent_poll_output(subagent: SubagentDetail) -> PlainHistoryCell {
+    const MAX_OUTPUT_GRAPHEMES: usize = 8000;
+    const MAX_RECENT_EVENTS: usize = 20;
+
+    let SubagentDetail {
+        agent_id,
+        status,
+        label,
+        mode,
+        rollout_path,
+        final_output,
+        recent_events,
+    } = subagent;
+
+    let mode_str = match mode {
+        SubagentMode::Explore => "explore",
+        SubagentMode::General => "general",
+    };
+    let status_str = match status {
+        SubagentStatus::Queued => "queued",
+        SubagentStatus::Running => "running",
+        SubagentStatus::Complete => "complete",
+        SubagentStatus::Aborted => "aborted",
+        SubagentStatus::Error => "error",
+    };
+
+    let status_span: Span<'static> = match status {
+        SubagentStatus::Queued => status_str.dim(),
+        SubagentStatus::Running => status_str.cyan(),
+        SubagentStatus::Complete => status_str.green(),
+        SubagentStatus::Aborted => status_str.dim(),
+        SubagentStatus::Error => status_str.red(),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(
+        vec![
+            "• Subagent ".dim(),
+            label.bold(),
+            " — ".dim(),
+            status_span,
+            " ".into(),
+            format!("({mode_str})").dim(),
+        ]
+        .into(),
+    );
+    lines.push(vec!["  id: ".dim(), agent_id.into()].into());
+    if let Some(rollout_path) = rollout_path {
+        lines.push(
+            vec![
+                "  rollout: ".dim(),
+                rollout_path.display().to_string().into(),
+            ]
+            .into(),
+        );
+    }
+
+    if let Some(final_output) = final_output {
+        let final_output = truncate_text(final_output.trim_end(), MAX_OUTPUT_GRAPHEMES);
+        if !final_output.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(vec!["  output:".dim()].into());
+            for line in final_output.lines() {
+                lines.push(vec!["    ".into(), line.to_string().into()].into());
+            }
+        }
+    }
+
+    if !recent_events.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(vec!["  recent events:".dim()].into());
+        let start = recent_events.len().saturating_sub(MAX_RECENT_EVENTS);
+        for event in recent_events.into_iter().skip(start) {
+            lines.push(vec!["    • ".dim(), event.into()].into());
+        }
+    }
+
     PlainHistoryCell { lines }
 }
 

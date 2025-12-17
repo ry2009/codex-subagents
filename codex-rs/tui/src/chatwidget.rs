@@ -33,6 +33,7 @@ use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::ExitedReviewModeEvent;
+use codex_core::protocol::ListCustomAgentsResponseEvent;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
 use codex_core::protocol::ListSkillsResponseEvent;
 use codex_core::protocol::ListSubagentsResponseEvent;
@@ -1660,6 +1661,41 @@ Constraints:\n\
             SlashCommand::Skills => {
                 self.insert_str("$");
             }
+            SlashCommand::Agents => {
+                self.add_custom_agents_output();
+            }
+            SlashCommand::Agent => {
+                if !self.config.features.enabled(Feature::Subagents) {
+                    self.add_info_message(
+                        "Custom agents require subagents (enable with `--enable subagents` or `[features] subagents = true`).".to_string(),
+                        None,
+                    );
+                    return;
+                }
+
+                let trimmed = args.trim();
+                let split_idx = trimmed
+                    .char_indices()
+                    .find_map(|(idx, ch)| ch.is_whitespace().then_some(idx));
+                let Some(split_idx) = split_idx else {
+                    self.add_info_message("Usage: /agent <name> <task>".to_string(), None);
+                    return;
+                };
+                let agent_name = trimmed[..split_idx].trim();
+                let task = trimmed[split_idx..].trim();
+                if agent_name.is_empty() || task.is_empty() {
+                    self.add_info_message("Usage: /agent <name> <task>".to_string(), None);
+                    return;
+                }
+
+                self.app_event_tx
+                    .send(AppEvent::CodexOp(Op::RunCustomAgent {
+                        name: agent_name.to_string(),
+                        prompt: task.to_string(),
+                        wait: true,
+                        timeout_ms: None,
+                    }));
+            }
             SlashCommand::Subagents => {
                 self.open_subagents_popup();
             }
@@ -1942,6 +1978,7 @@ Constraints:\n\
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
+            EventMsg::ListCustomAgentsResponse(ev) => self.on_list_custom_agents(ev),
             EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
             EventMsg::ListSubagentsResponse(ev) => self.on_list_subagents(ev),
             EventMsg::PollSubagentResponse(ev) => self.on_poll_subagent_response(ev),
@@ -3086,6 +3123,10 @@ Constraints:\n\
         }
     }
 
+    pub(crate) fn add_custom_agents_output(&mut self) {
+        self.submit_op(Op::ListCustomAgents);
+    }
+
     /// Forward file-search results to the bottom pane.
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
@@ -3150,6 +3191,10 @@ Constraints:\n\
             ev.resource_templates,
             &ev.auth_statuses,
         ));
+    }
+
+    fn on_list_custom_agents(&mut self, ev: ListCustomAgentsResponseEvent) {
+        self.add_to_history(history_cell::new_custom_agents_output(ev));
     }
 
     fn on_list_custom_prompts(&mut self, ev: ListCustomPromptsResponseEvent) {

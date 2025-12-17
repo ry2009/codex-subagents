@@ -22,6 +22,17 @@ pub(crate) enum AppEvent {
     /// Start a new session.
     NewSession,
 
+    /// Open the subagents management popup.
+    OpenSubagentsPopup,
+
+    /// Open the action picker for a single subagent.
+    OpenSubagentActions {
+        agent_id: String,
+        label: String,
+        mode: codex_core::protocol::SubagentMode,
+        status: codex_core::protocol::SubagentStatus,
+    },
+
     /// Open the resume picker inside the running TUI session.
     OpenResumePicker,
 
