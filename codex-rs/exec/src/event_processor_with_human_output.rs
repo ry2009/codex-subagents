@@ -572,6 +572,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             | EventMsg::GetHistoryEntryResponse(_)
             | EventMsg::McpListToolsResponse(_)
             | EventMsg::ListCustomPromptsResponse(_)
+            | EventMsg::ListCustomAgentsResponse(_)
             | EventMsg::ListSkillsResponse(_)
             | EventMsg::ListSubagentsResponse(_)
             | EventMsg::PollSubagentResponse(_)
