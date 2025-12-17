@@ -35,7 +35,10 @@ impl ToolRouter {
         config: &ToolsConfig,
         mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
     ) -> Self {
-        let builder = build_specs(config, mcp_tools);
+        let mut builder = build_specs(config, mcp_tools);
+        if let Some(allowlist) = &config.tool_name_allowlist {
+            builder.restrict_to_tool_names(allowlist);
+        }
         let (specs, registry) = builder.build();
 
         Self { registry, specs }

@@ -171,6 +171,19 @@ impl ToolRegistryBuilder {
         }
     }
 
+    /// Restrict the tool registry to an explicit allowlist of tool names.
+    ///
+    /// This trims both the serialized tool specs sent to the model and the
+    /// runtime dispatch handlers.
+    pub fn restrict_to_tool_names(&mut self, allowlist: &[String]) {
+        use std::collections::HashSet;
+
+        let allowed: HashSet<&str> = allowlist.iter().map(String::as_str).collect();
+        self.specs.retain(|spec| allowed.contains(spec.spec.name()));
+        self.handlers
+            .retain(|name, _| allowed.contains(name.as_str()));
+    }
+
     pub fn push_spec(&mut self, spec: ToolSpec) {
         self.push_spec_with_parallel_support(spec, false);
     }
