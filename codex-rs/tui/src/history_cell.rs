@@ -30,6 +30,9 @@ use codex_core::protocol::FileChange;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
+use codex_core::protocol::SubagentDetail;
+use codex_core::protocol::SubagentMode;
+use codex_core::protocol::SubagentStatus;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::openai_models::ReasoningSummaryFormat;
 use codex_protocol::plan_tool::PlanItemArg;
@@ -1292,6 +1295,87 @@ pub(crate) fn new_info_event(message: String, hint: Option<String>) -> PlainHist
         line.push(hint.dark_gray());
     }
     let lines: Vec<Line<'static>> = vec![line.into()];
+    PlainHistoryCell { lines }
+}
+
+pub(crate) fn new_subagent_poll_output(subagent: SubagentDetail) -> PlainHistoryCell {
+    const MAX_OUTPUT_GRAPHEMES: usize = 8000;
+    const MAX_RECENT_EVENTS: usize = 20;
+
+    let SubagentDetail {
+        agent_id,
+        status,
+        label,
+        mode,
+        rollout_path,
+        final_output,
+        recent_events,
+    } = subagent;
+
+    let mode_str = match mode {
+        SubagentMode::Explore => "explore",
+        SubagentMode::General => "general",
+    };
+    let status_str = match status {
+        SubagentStatus::Queued => "queued",
+        SubagentStatus::Running => "running",
+        SubagentStatus::Complete => "complete",
+        SubagentStatus::Aborted => "aborted",
+        SubagentStatus::Error => "error",
+    };
+
+    let status_span: Span<'static> = match status {
+        SubagentStatus::Queued => status_str.dim(),
+        SubagentStatus::Running => status_str.cyan(),
+        SubagentStatus::Complete => status_str.green(),
+        SubagentStatus::Aborted => status_str.dim(),
+        SubagentStatus::Error => status_str.red(),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(
+        vec![
+            "• Subagent ".dim(),
+            label.bold(),
+            " — ".dim(),
+            status_span,
+            " ".into(),
+            format!("({mode_str})").dim(),
+        ]
+        .into(),
+    );
+    lines.push(vec!["  id: ".dim(), agent_id.into()].into());
+    if let Some(rollout_path) = rollout_path {
+        lines.push(
+            vec![
+                "  rollout: ".dim(),
+                rollout_path.display().to_string().into(),
+            ]
+            .into(),
+        );
+    }
+
+    if let Some(final_output) = final_output {
+        let final_output = truncate_text(final_output.trim_end(), MAX_OUTPUT_GRAPHEMES);
+        if !final_output.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.push(vec!["  output:".dim()].into());
+            for line in final_output.lines() {
+                lines.push(vec!["    ".into(), line.to_string().into()].into());
+            }
+        }
+    }
+
+    if !recent_events.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(vec!["  recent events:".dim()].into());
+        let start = recent_events.len().saturating_sub(MAX_RECENT_EVENTS);
+        for event in recent_events.into_iter().skip(start) {
+            lines.push(vec!["    • ".dim(), event.into()].into());
+        }
+    }
+
     PlainHistoryCell { lines }
 }
 

@@ -195,6 +195,39 @@ pub enum Op {
         cwds: Vec<PathBuf>,
     },
 
+    /// Request the list of in-flight and recently completed subagents.
+    ListSubagents,
+
+    /// Poll a subagent for its current status and output.
+    PollSubagent {
+        agent_id: String,
+
+        /// Optional server-side await duration. When set, the server may wait
+        /// up to this many milliseconds for the agent to change state before
+        /// responding.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        await_ms: Option<u64>,
+    },
+
+    /// Request cancellation of a subagent by id.
+    CancelSubagent { agent_id: String },
+
+    /// Run a small multi-agent planning workflow using background subagents.
+    OrchestratePlan {
+        /// What the user wants to achieve. This is fed into multiple subagents
+        /// and their outputs are returned as a consolidated plan.
+        prompt: String,
+    },
+
+    /// Run a small multi-agent "solve" workflow using background subagents.
+    ///
+    /// This is similar to `OrchestratePlan` but prompts subagents to propose
+    /// solutions and critique them, producing a consolidated recommendation.
+    OrchestrateSolve {
+        /// What the user wants to solve.
+        prompt: String,
+    },
+
     /// Request the agent to summarize the current conversation context.
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
@@ -599,6 +632,15 @@ pub enum EventMsg {
 
     /// List of skills available to the agent.
     ListSkillsResponse(ListSkillsResponseEvent),
+
+    /// List of subagents managed by the session.
+    ListSubagentsResponse(ListSubagentsResponseEvent),
+
+    /// Poll response for a single subagent.
+    PollSubagentResponse(PollSubagentResponseEvent),
+
+    /// Acknowledgement of a subagent cancel request.
+    CancelSubagentResponse(CancelSubagentResponseEvent),
 
     PlanUpdate(UpdatePlanArgs),
 
@@ -1695,6 +1737,65 @@ pub struct SkillsListEntry {
     pub cwd: PathBuf,
     pub skills: Vec<SkillMetadata>,
     pub errors: Vec<SkillErrorInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum SubagentMode {
+    Explore,
+    General,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Queued,
+    Running,
+    Complete,
+    Aborted,
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SubagentSummary {
+    pub agent_id: String,
+    pub status: SubagentStatus,
+    pub label: String,
+    pub mode: SubagentMode,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct SubagentDetail {
+    pub agent_id: String,
+    pub status: SubagentStatus,
+    pub label: String,
+    pub mode: SubagentMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollout_path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<String>,
+    pub recent_events: Vec<String>,
+}
+
+/// Response payload for `Op::ListSubagents`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ListSubagentsResponseEvent {
+    pub enabled: bool,
+    pub subagents: Vec<SubagentSummary>,
+}
+
+/// Response payload for `Op::PollSubagent`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct PollSubagentResponseEvent {
+    pub subagent: SubagentDetail,
+}
+
+/// Response payload for `Op::CancelSubagent`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CancelSubagentResponseEvent {
+    pub agent_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]

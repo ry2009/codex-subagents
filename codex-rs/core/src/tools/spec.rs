@@ -22,6 +22,7 @@ pub(crate) struct ToolsConfig {
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
+    pub include_subagent_tools: bool,
     pub experimental_supported_tools: Vec<String>,
 }
 
@@ -39,6 +40,7 @@ impl ToolsConfig {
         let include_apply_patch_tool = features.enabled(Feature::ApplyPatchFreeform);
         let include_web_search_request = features.enabled(Feature::WebSearchRequest);
         let include_view_image_tool = features.enabled(Feature::ViewImageTool);
+        let include_subagent_tools = features.enabled(Feature::Subagents);
 
         let shell_type = if !features.enabled(Feature::ShellTool) {
             ConfigShellToolType::Disabled
@@ -65,6 +67,7 @@ impl ToolsConfig {
             apply_patch_tool_type,
             web_search_request: include_web_search_request,
             include_view_image_tool,
+            include_subagent_tools,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
         }
     }
@@ -971,12 +974,262 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
+fn create_delegate_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Prompt to run in the subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "label".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional label used for telemetry/tagging (sent as `x-openai-subagent`)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "skills".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String {
+                description: Some("Skill name.".to_string()),
+            }),
+            description: Some("Optional list of skills to inject into the subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "allow_tools".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Whether the subagent is allowed to call tools (defaults to false).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum time to wait for the subagent to complete (milliseconds).".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "delegate".to_string(),
+        description: "Runs a focused one-shot subagent and returns its output.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_subagent_spawn_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional explicit id for the agent (useful for deterministic orchestration)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Prompt to run in the subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "label".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional label used for telemetry/tagging (sent as `x-openai-subagent`)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some("Subagent profile: `general` (default) or `explore`.".to_string()),
+        },
+    );
+    properties.insert(
+        "skills".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String {
+                description: Some("Skill name.".to_string()),
+            }),
+            description: Some("Optional list of skills to inject into the subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional deadline for the subagent run (milliseconds). Defaults to a generous value."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "subagent_spawn".to_string(),
+        description: "Spawns a background one-shot subagent and returns an agent_id to poll."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_subagent_poll_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some("Agent id returned by subagent_spawn.".to_string()),
+        },
+    );
+    properties.insert(
+        "await_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional time to wait for the subagent to make progress (milliseconds)."
+                    .to_string(),
+            ),
+        },
+    );
+    ToolSpec::Function(ResponsesApiTool {
+        name: "subagent_poll".to_string(),
+        description: "Poll a background subagent for status and output.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["agent_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_subagent_cancel_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some("Agent id returned by subagent_spawn.".to_string()),
+        },
+    );
+    ToolSpec::Function(ResponsesApiTool {
+        name: "subagent_cancel".to_string(),
+        description: "Cancel a background subagent.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["agent_id".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_subagent_list_tool() -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: "subagent_list".to_string(),
+        description: "List background subagents spawned in this session.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: Some(Vec::new()),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_subagent_resume_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "agent_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional explicit id for the agent (useful for deterministic orchestration)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "rollout_path".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Path to a Codex rollout (.jsonl) file to resume as initial history.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "prompt".to_string(),
+        JsonSchema::String {
+            description: Some("Prompt to run in the resumed subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "label".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional label used for telemetry/tagging (sent as `x-openai-subagent`)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some("Subagent profile: `general` (default) or `explore`.".to_string()),
+        },
+    );
+    properties.insert(
+        "skills".to_string(),
+        JsonSchema::Array {
+            items: Box::new(JsonSchema::String {
+                description: Some("Skill name.".to_string()),
+            }),
+            description: Some("Optional list of skills to inject into the subagent.".to_string()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some("Optional deadline for the subagent run (milliseconds).".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "subagent_resume".to_string(),
+        description: "Resumes a previous subagent rollout and runs a new prompt.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["rollout_path".to_string(), "prompt".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
     mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
 ) -> ToolRegistryBuilder {
     use crate::tools::handlers::ApplyPatchHandler;
+    use crate::tools::handlers::DelegateHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::McpHandler;
@@ -985,6 +1238,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::ShellCommandHandler;
     use crate::tools::handlers::ShellHandler;
+    use crate::tools::handlers::SubagentHandler;
     use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
@@ -1028,6 +1282,32 @@ pub(crate) fn build_specs(
         builder.register_handler("container.exec", shell_handler.clone());
         builder.register_handler("local_shell", shell_handler);
         builder.register_handler("shell_command", shell_command_handler);
+    }
+
+    if config.include_subagent_tools {
+        let delegate_handler = Arc::new(DelegateHandler);
+        builder.push_spec_with_parallel_support(create_delegate_tool(), true);
+        builder.register_handler("delegate", delegate_handler);
+
+        let subagent_handler = Arc::new(SubagentHandler);
+        for spec in [
+            create_subagent_spawn_tool(),
+            create_subagent_poll_tool(),
+            create_subagent_cancel_tool(),
+            create_subagent_list_tool(),
+            create_subagent_resume_tool(),
+        ] {
+            builder.push_spec_with_parallel_support(spec, true);
+        }
+        for name in [
+            "subagent_spawn",
+            "subagent_poll",
+            "subagent_cancel",
+            "subagent_list",
+            "subagent_resume",
+        ] {
+            builder.register_handler(name, subagent_handler.clone());
+        }
     }
 
     builder.push_spec_with_parallel_support(create_list_mcp_resources_tool(), true);
@@ -1303,6 +1583,61 @@ mod tests {
                 "view_image",
             ],
         );
+    }
+
+    #[test]
+    fn test_build_specs_includes_subagent_tools_when_enabled() {
+        let mut features = Features::with_defaults();
+        features.enable(Feature::Subagents);
+        assert_model_tools(
+            "gpt-5-codex",
+            &features,
+            &[
+                "shell_command",
+                "delegate",
+                "subagent_spawn",
+                "subagent_poll",
+                "subagent_cancel",
+                "subagent_list",
+                "subagent_resume",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "read_mcp_resource",
+                "update_plan",
+                "apply_patch",
+                "view_image",
+            ],
+        );
+
+        let config = test_config();
+        let model_family = ModelsManager::construct_model_family_offline("gpt-5-codex", &config);
+        let tools_config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            features: &features,
+        });
+        let (tools, _) = build_specs(&tools_config, None).build();
+        let delegate = tools
+            .iter()
+            .find(|t| t.spec.name() == "delegate")
+            .expect("delegate tool exists");
+        assert!(delegate.supports_parallel_tool_calls);
+
+        for name in [
+            "subagent_spawn",
+            "subagent_poll",
+            "subagent_cancel",
+            "subagent_list",
+            "subagent_resume",
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.spec.name() == name)
+                .unwrap_or_else(|| panic!("{name} tool exists"));
+            assert!(
+                tool.supports_parallel_tool_calls,
+                "{name} should support parallel calls"
+            );
+        }
     }
 
     #[test]

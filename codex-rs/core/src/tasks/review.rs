@@ -20,6 +20,7 @@ use crate::protocol::SandboxPolicy;
 use crate::review_format::format_review_findings_block;
 use crate::review_format::render_review_output_text;
 use crate::state::TaskKind;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 
 use super::SessionTask;
@@ -103,6 +104,7 @@ async fn start_review_conversation(
         ctx.clone(),
         cancellation_token,
         None,
+        SubAgentSource::Review,
     )
     .await)
         .ok()

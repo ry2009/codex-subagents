@@ -20,6 +20,8 @@ Run `just fmt` (in `codex-rs` directory) automatically after making Rust code ch
 2. Once those pass, if any changes were made in common, core, or protocol, run the complete test suite with `cargo test --all-features`.
    When running interactively, ask the user before running `just fix` to finalize. `just fmt` does not require approval. project-specific or individual tests can be run without asking the user, but do ask the user before running the complete test suite.
 
+Note: `codex-rs/core` includes CLI smoke tests that execute the `codex` binary. If you run `cargo test -p codex-core` directly and see “No such file or directory” for `codex`, build it first with `cargo build -p codex-cli --bin codex`, or run `cargo test --all-features` which will build it.
+
 ## TUI style conventions
 
 See `codex-rs/tui/styles.md`.

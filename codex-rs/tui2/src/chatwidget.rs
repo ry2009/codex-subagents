@@ -132,6 +132,7 @@ use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ConversationManager;
+use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
@@ -1495,8 +1496,8 @@ impl ChatWidget {
                         };
                         self.queue_user_message(user_message);
                     }
-                    InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                    InputResult::Command(cmd, args) => {
+                        self.dispatch_command(cmd, args);
                     }
                     InputResult::None => {}
                 }
@@ -1519,7 +1520,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
+    fn dispatch_command(&mut self, cmd: SlashCommand, args: String) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -1561,6 +1562,50 @@ impl ChatWidget {
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+            }
+            SlashCommand::Plan => {
+                let task = args.trim();
+                if task.is_empty() {
+                    self.add_info_message("Usage: /plan <task>".to_string(), None);
+                    return;
+                }
+
+                if self.config.features.enabled(Feature::Subagents) {
+                    self.app_event_tx
+                        .send(AppEvent::CodexOp(Op::OrchestratePlan {
+                            prompt: task.to_string(),
+                        }));
+                    return;
+                }
+
+                let prompt = format!(
+                    "Create a concise implementation plan for this task.\n\
+\n\
+Task:\n\
+{task}\n\
+\n\
+Constraints:\n\
+- Do not run shell commands or apply patches.\n\
+- Call update_plan with 5–8 steps (exactly one in_progress).\n"
+                );
+                self.submit_user_message(prompt.into());
+            }
+            SlashCommand::Solve => {
+                let task = args.trim();
+                if task.is_empty() {
+                    self.add_info_message("Usage: /solve <task>".to_string(), None);
+                    return;
+                }
+
+                if self.config.features.enabled(Feature::Subagents) {
+                    self.app_event_tx
+                        .send(AppEvent::CodexOp(Op::OrchestrateSolve {
+                            prompt: task.to_string(),
+                        }));
+                    return;
+                }
+
+                self.submit_user_message(task.to_string().into());
             }
             SlashCommand::Model => {
                 self.open_model_popup();
@@ -1886,6 +1931,9 @@ impl ChatWidget {
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
             EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
+            EventMsg::ListSubagentsResponse(_)
+            | EventMsg::PollSubagentResponse(_)
+            | EventMsg::CancelSubagentResponse(_) => {}
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::DeprecationNotice(ev) => self.on_deprecation_notice(ev),
