@@ -82,6 +82,12 @@ If you don't want to run the interactive TUI, you can also invoke the same orche
 
 These commands print a warning with spawned agent ids and then print the consolidated Markdown report.
 
+## Custom agents
+
+Custom agents are named prompt templates that run as background subagents. Define agents in `.codex/agents/*.md` (repo) or `$CODEX_HOME/agents/*.md` (user), list them with `/agents`, and run them with `/agent <name> <task>`.
+
+See [docs/custom_agents.md](./custom_agents.md) for the full format and examples.
+
 ## `delegate` (synchronous one-shot)
 
 Arguments:
@@ -143,11 +149,26 @@ To avoid “subagents melt my laptop” scenarios, Codex:
 - Disables subagent recursion (a subagent cannot spawn more subagents).
 - Budgets per-subagent retained output/event sizes (see `[subagents]`).
 
-## Benchmarking
+### Defaults
 
-There is an ignored, benchmark-style integration test you can run locally:
+Unless overridden in config, Codex uses:
+
+- `max_concurrency`: `min(available_parallelism, 4)` (clamped to `1..=4`)
+- `default_timeout_ms`: `1800000` (30 minutes) for background subagents
+- `orchestration_timeout_ms`: `180000` (3 minutes) for `/plan` and `/solve` (and cancels stragglers)
+- `max_agents`: `128` (older completed subagents are pruned)
+
+### Benchmarking
+
+There is an ignored, benchmark-style integration test you can run locally to measure **local orchestration overhead** (not model latency):
 
 ```bash
 cd codex-rs
 cargo test -p codex-core bench_subagents_spawn_poll_16 -- --ignored --nocapture
+```
+
+Example output (Apple M4 Max, macOS 15.6, rustc 1.92.0):
+
+```
+bench_subagents_spawn_poll_16: wall=63ms user=41ms sys=29ms maxrss=39MB
 ```

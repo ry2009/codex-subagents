@@ -15,6 +15,8 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/model`     | choose what model and reasoning effort to use                              |
 | `/approvals` | choose what Codex can do without approval                                  |
 | `/review`    | review my current changes and find issues                                  |
+| `/plan`      | create a multi-agent plan for a task (experimental; requires subagents)    |
+| `/solve`     | solve a task with multi-agent deliberation (experimental; requires subagents) |
 | `/new`       | start a new chat during a conversation                                     |
 | `/resume`    | resume an old chat                                                         |
 | `/init`      | create an AGENTS.md file with instructions for Codex                       |
@@ -25,6 +27,9 @@ Control Codex’s behavior during an interactive session with slash commands.
 | `/status`    | show current session configuration and token usage                         |
 | `/mcp`       | list configured MCP tools                                                  |
 | `/skills`    | browse and insert skills (experimental; see [docs/skills.md](./skills.md)) |
+| `/agents`    | list available custom agents (experimental; requires subagents)            |
+| `/agent`     | run a custom agent as a background subagent (experimental; requires subagents) |
+| `/subagents` | manage background subagents for this session (experimental)                |
 | `/logout`    | log out of Codex                                                           |
 | `/quit`      | exit Codex                                                                 |
 | `/exit`      | exit Codex                                                                 |

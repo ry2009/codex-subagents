@@ -13,3 +13,4 @@ Help us improve by filing issues or submitting PRs (see [docs/contributing.md](d
 
 - Skills: see [docs/skills.md](docs/skills.md)
 - Subagents: see [docs/subagents.md](docs/subagents.md)
+- Custom agents: see [docs/custom_agents.md](docs/custom_agents.md) (requires subagents)
