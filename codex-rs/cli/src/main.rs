@@ -97,6 +97,12 @@ enum Subcommand {
     /// [experimental] Solve a task using background subagents.
     Solve(OrchestrateCommand),
 
+    /// [experimental] List available custom agents.
+    Agents(AgentsCommand),
+
+    /// [experimental] Run a custom agent.
+    Agent(AgentCommand),
+
     /// Run a code review non-interactively.
     Review(ReviewArgs),
 
@@ -171,6 +177,50 @@ struct OrchestrateCommand {
     config_profile: Option<String>,
 
     /// Tell the agent to use the specified directory as its working root.
+    #[clap(long = "cd", short = 'C', value_name = "DIR")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AgentsCommand {
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+
+    /// Tell Codex to use the specified directory as its working root.
+    #[clap(long = "cd", short = 'C', value_name = "DIR")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AgentCommand {
+    /// The agent name.
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// The task prompt.
+    #[arg(value_name = "TASK")]
+    task: String,
+
+    /// Spawn the agent but do not wait for completion.
+    #[arg(long = "no-wait", default_value_t = false)]
+    no_wait: bool,
+
+    /// Optional deadline for the agent run (milliseconds).
+    #[arg(long = "timeout-ms")]
+    timeout_ms: Option<u64>,
+
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+
+    /// Tell Codex to use the specified directory as its working root.
     #[clap(long = "cd", short = 'C', value_name = "DIR")]
     cwd: Option<PathBuf>,
 }
@@ -523,6 +573,20 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             );
             run_orchestrate(OrchestrateKind::Solve, solve_cli).await?;
         }
+        Some(Subcommand::Agents(mut agents_cli)) => {
+            prepend_config_flags(
+                &mut agents_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_list_custom_agents(agents_cli).await?;
+        }
+        Some(Subcommand::Agent(mut agent_cli)) => {
+            prepend_config_flags(
+                &mut agent_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_custom_agent(agent_cli).await?;
+        }
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
@@ -765,6 +829,179 @@ async fn run_orchestrate(kind: OrchestrateKind, cmd: OrchestrateCommand) -> anyh
             match event.msg {
                 EventMsg::Warning(WarningEvent { message }) => {
                     eprintln!("{message}\n");
+                }
+                EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                    println!("{message}");
+                    break;
+                }
+                EventMsg::Error(ErrorEvent { message, .. }) => {
+                    return Err(anyhow::anyhow!("{message}"));
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+
+    let _ = conversation.submit(Op::Shutdown).await;
+    Ok(())
+}
+
+async fn run_list_custom_agents(cmd: AgentsCommand) -> anyhow::Result<()> {
+    let mut cli_kv_overrides = cmd
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+
+    if let Some(cwd) = cmd.cwd {
+        cli_kv_overrides.push((
+            "cwd".to_string(),
+            toml::Value::String(cwd.to_string_lossy().to_string()),
+        ));
+    }
+
+    // Custom agents require subagents for execution.
+    cli_kv_overrides.push(("features.subagents".to_string(), toml::Value::Boolean(true)));
+
+    let overrides = ConfigOverrides {
+        config_profile: cmd.config_profile,
+        ..Default::default()
+    };
+    let mut config = Config::load_with_cli_overrides(cli_kv_overrides, overrides).await?;
+    config.features.enable(Feature::Subagents);
+
+    // Avoid update prompts / UI-only flows in non-interactive mode.
+    config.check_for_update_on_startup = false;
+
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        false,
+        config.cli_auth_credentials_store_mode,
+    );
+    let server = Arc::new(ConversationManager::new(auth_manager, SessionSource::Cli));
+    let NewConversation { conversation, .. } = server.new_conversation(config).await?;
+
+    let op_id = conversation.submit(Op::ListCustomAgents).await?;
+    loop {
+        let event = conversation.next_event().await?;
+        if event.id != op_id {
+            continue;
+        }
+        match event.msg {
+            EventMsg::ListCustomAgentsResponse(ev) => {
+                for agent in ev.agents {
+                    let scope = match agent.scope {
+                        codex_protocol::protocol::CustomAgentScope::User => "user",
+                        codex_protocol::protocol::CustomAgentScope::Repo => "repo",
+                    };
+                    let mode = agent
+                        .mode
+                        .map(|m| match m {
+                            codex_protocol::protocol::SubagentMode::Explore => "explore",
+                            codex_protocol::protocol::SubagentMode::General => "general",
+                        })
+                        .unwrap_or("-");
+                    let model = agent.model.as_deref().unwrap_or("-");
+                    let tools_policy = match agent.tools_policy {
+                        codex_protocol::protocol::CustomAgentToolsPolicy::Inherit => "inherit",
+                        codex_protocol::protocol::CustomAgentToolsPolicy::None => "none",
+                        codex_protocol::protocol::CustomAgentToolsPolicy::Allowlist => "allowlist",
+                    };
+                    let allowed = if agent.allowed_tools.is_empty() {
+                        "-".to_string()
+                    } else {
+                        agent.allowed_tools.join(",")
+                    };
+                    let description = agent.description.unwrap_or_default();
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        agent.name,
+                        scope,
+                        mode,
+                        model,
+                        tools_policy,
+                        allowed,
+                        agent.path.display(),
+                        description
+                    );
+                }
+                for err in ev.errors {
+                    eprintln!("error: {}: {}", err.path.display(), err.message);
+                }
+                break;
+            }
+            EventMsg::Error(ErrorEvent { message, .. }) => {
+                return Err(anyhow::anyhow!("{message}"));
+            }
+            _ => {}
+        }
+    }
+
+    let _ = conversation.submit(Op::Shutdown).await;
+    Ok(())
+}
+
+async fn run_custom_agent(cmd: AgentCommand) -> anyhow::Result<()> {
+    let mut cli_kv_overrides = cmd
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+
+    if let Some(cwd) = cmd.cwd.as_ref() {
+        cli_kv_overrides.push((
+            "cwd".to_string(),
+            toml::Value::String(cwd.to_string_lossy().to_string()),
+        ));
+    }
+
+    // Custom agent execution requires subagents.
+    cli_kv_overrides.push(("features.subagents".to_string(), toml::Value::Boolean(true)));
+
+    let overrides = ConfigOverrides {
+        config_profile: cmd.config_profile.clone(),
+        ..Default::default()
+    };
+    let mut config = Config::load_with_cli_overrides(cli_kv_overrides, overrides).await?;
+    config.features.enable(Feature::Subagents);
+
+    // Avoid update prompts / UI-only flows in non-interactive mode.
+    config.check_for_update_on_startup = false;
+
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        false,
+        config.cli_auth_credentials_store_mode,
+    );
+    let server = Arc::new(ConversationManager::new(auth_manager, SessionSource::Cli));
+    let NewConversation { conversation, .. } = server.new_conversation(config.clone()).await?;
+
+    let op_id = conversation
+        .submit(Op::RunCustomAgent {
+            name: cmd.name.clone(),
+            prompt: cmd.task.clone(),
+            wait: !cmd.no_wait,
+            timeout_ms: cmd.timeout_ms,
+        })
+        .await?;
+
+    let wait_timeout_ms = cmd.timeout_ms.unwrap_or_else(|| {
+        u64::try_from(config.subagents.default_timeout.as_millis()).unwrap_or(u64::MAX)
+    });
+    let timeout = Duration::from_millis(wait_timeout_ms);
+
+    tokio::time::timeout(timeout, async {
+        loop {
+            let event = conversation.next_event().await?;
+            if event.id != op_id {
+                continue;
+            }
+            match event.msg {
+                EventMsg::Warning(WarningEvent { message }) => {
+                    eprintln!("{message}\n");
+                    if cmd.no_wait {
+                        break;
+                    }
                 }
                 EventMsg::AgentMessage(AgentMessageEvent { message }) => {
                     println!("{message}");
