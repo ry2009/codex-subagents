@@ -16,6 +16,8 @@ pub enum SlashCommand {
     Approvals,
     Skills,
     Review,
+    Plan,
+    Solve,
     New,
     Resume,
     Init,
@@ -42,6 +44,8 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
+            SlashCommand::Plan => "create a multi-agent plan for a task",
+            SlashCommand::Solve => "solve a task with multi-agent deliberation",
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Undo => "ask Codex to undo a turn",
             SlashCommand::Quit | SlashCommand::Exit => "exit Codex",
@@ -64,6 +68,10 @@ impl SlashCommand {
         self.into()
     }
 
+    pub fn accepts_args(self) -> bool {
+        matches!(self, SlashCommand::Plan | SlashCommand::Solve)
+    }
+
     /// Whether this command can be run while a task is in progress.
     pub fn available_during_task(self) -> bool {
         match self {
@@ -75,6 +83,8 @@ impl SlashCommand {
             | SlashCommand::Model
             | SlashCommand::Approvals
             | SlashCommand::Review
+            | SlashCommand::Plan
+            | SlashCommand::Solve
             | SlashCommand::Logout => false,
             SlashCommand::Diff
             | SlashCommand::Mention
