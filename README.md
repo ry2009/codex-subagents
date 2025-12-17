@@ -1,3 +1,29 @@
+# codex-subagents (demo fork)
+
+This repository is a fork of `openai/codex` that implements **experimental subagents** + **multi-agent orchestration** (inspired by “sub-agents” workflows in tools like Claude Code).
+
+**What’s in this fork**
+
+- Feature flag `subagents` that exposes: `delegate`, `subagent_spawn`, `subagent_poll`, `subagent_cancel`, `subagent_list`, `subagent_resume` (requests are tagged with `x-openai-subagent`).
+- Multi-agent workflows: `/plan <task>` + `/solve <task>` (TUI + TUI2) and `codex plan` / `codex solve` (non-interactive).
+- Subagent management UI in the default TUI: `/subagents` (list/poll/cancel).
+- Performance guardrails: configurable concurrency cap + timeouts + output/event budgeting (see `[subagents]` in config).
+
+**Quick demo (build from source)**
+
+```bash
+cd codex-rs
+
+# Non-interactive orchestration:
+cargo run --bin codex -- --enable subagents plan "Add a foo() helper and tests"
+cargo run --bin codex -- --enable subagents solve "Why does test X fail on CI?"
+
+# Interactive TUI (then try: /plan ..., /solve ..., /subagents):
+cargo run --bin codex -- --enable subagents
+```
+
+Docs: `docs/subagents.md`.
+
 <p align="center"><code>npm i -g @openai/codex</code><br />or <code>brew install --cask codex</code></p>
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
