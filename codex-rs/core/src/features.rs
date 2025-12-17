@@ -60,6 +60,8 @@ pub enum Feature {
     ParallelToolCalls,
     /// Experimental skills injection (CLI flag-driven).
     Skills,
+    /// Experimental tool-driven delegation to subagents.
+    Subagents,
     /// Experimental shell snapshotting.
     ShellSnapshot,
     /// Experimental TUI v2 (viewport) implementation.
@@ -350,6 +352,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::Skills,
         key: "skills",
+        stage: Stage::Experimental,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Subagents,
+        key: "subagents",
         stage: Stage::Experimental,
         default_enabled: false,
     },

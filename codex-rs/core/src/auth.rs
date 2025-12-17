@@ -32,12 +32,13 @@ use crate::token_data::parse_id_token;
 use crate::util::try_parse_error_message;
 use codex_client::CodexHttpClient;
 use codex_protocol::account::PlanType as AccountPlanType;
+use serde_json::Value;
+use thiserror::Error;
+
 #[cfg(any(test, feature = "test-support"))]
 use once_cell::sync::Lazy;
-use serde_json::Value;
 #[cfg(any(test, feature = "test-support"))]
 use tempfile::TempDir;
-use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct CodexAuth {

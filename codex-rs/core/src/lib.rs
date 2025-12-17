@@ -45,6 +45,7 @@ pub mod path_utils;
 pub mod powershell;
 pub mod sandboxing;
 mod stream_events_utils;
+mod subagents;
 mod text_encoding;
 pub mod token_data;
 mod truncate;

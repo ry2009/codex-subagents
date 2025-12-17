@@ -17,6 +17,52 @@ use serde::de::Error as SerdeError;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 
+pub const DEFAULT_SUBAGENTS_MAX_AGENTS: usize = 128;
+pub const DEFAULT_SUBAGENTS_MAX_EVENTS: usize = 64;
+pub const DEFAULT_SUBAGENTS_MAX_EVENT_CHARS: usize = 2 * 1024;
+pub const DEFAULT_SUBAGENTS_MAX_OUTPUT_CHARS: usize = 32 * 1024;
+pub const DEFAULT_SUBAGENTS_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+pub const DEFAULT_SUBAGENTS_ORCHESTRATION_TIMEOUT_MS: u64 = 3 * 60 * 1000;
+
+/// Subagent settings loaded from config.toml. Fields are optional so we can apply defaults.
+#[derive(Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct SubagentsConfigToml {
+    /// Maximum number of concurrently running subagents across the whole process.
+    pub max_concurrency: Option<usize>,
+
+    /// Maximum number of subagents tracked by the session before older completed
+    /// entries are pruned.
+    pub max_agents: Option<usize>,
+
+    /// Default timeout for background subagents spawned via tools.
+    pub default_timeout_ms: Option<u64>,
+
+    /// Timeout used for built-in orchestration commands like `/plan` and `/solve`.
+    pub orchestration_timeout_ms: Option<u64>,
+
+    /// Maximum number of recent event strings kept per subagent.
+    pub max_events: Option<usize>,
+
+    /// Maximum number of characters kept per event string.
+    pub max_event_chars: Option<usize>,
+
+    /// Maximum number of characters kept for a subagent's final output.
+    pub max_output_chars: Option<usize>,
+}
+
+/// Effective subagent settings after defaults are applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentsConfig {
+    /// When unset, Codex chooses a default based on available CPU cores.
+    pub max_concurrency: Option<usize>,
+    pub max_agents: usize,
+    pub default_timeout: Duration,
+    pub orchestration_timeout: Duration,
+    pub max_events: usize,
+    pub max_event_chars: usize,
+    pub max_output_chars: usize,
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     #[serde(flatten)]

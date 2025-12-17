@@ -215,6 +215,8 @@ impl Codex {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
+        crate::subagents::init_global_subagent_limiter(config.subagents.max_concurrency);
+
         let loaded_skills = if config.features.enabled(Feature::Skills) {
             Some(skills_manager.skills_for_cwd(&config.cwd))
         } else {
@@ -344,8 +346,17 @@ pub(crate) struct Session {
     /// session.
     features: Features,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Pending approvals that are not associated with the currently active turn
+    /// (e.g., approvals requested by background subagents).
+    background_approvals: Mutex<HashMap<String, oneshot::Sender<ReviewDecision>>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApprovalScope {
+    ActiveTurn,
+    Background,
 }
 
 /// The context needed for a single turn of the conversation.
@@ -669,6 +680,7 @@ impl Session {
             models_manager: Arc::clone(&models_manager),
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
+            subagent_manager: Arc::new(crate::subagents::SubagentManager::default()),
         };
 
         let sess = Arc::new(Session {
@@ -677,6 +689,7 @@ impl Session {
             state: Mutex::new(state),
             features: config.features.clone(),
             active_turn: Mutex::new(None),
+            background_approvals: Mutex::new(HashMap::new()),
             services,
             next_internal_sub_id: AtomicU64::new(0),
         });
@@ -1080,8 +1093,80 @@ impl Session {
         rx_approve
     }
 
-    pub async fn notify_approval(&self, sub_id: &str, decision: ReviewDecision) {
-        let entry = {
+    pub(crate) async fn request_command_approval_background(
+        &self,
+        turn_id: String,
+        call_id: String,
+        command: Vec<String>,
+        cwd: PathBuf,
+        reason: Option<String>,
+        proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
+    ) -> ReviewDecision {
+        let (tx_approve, rx_approve) = oneshot::channel();
+        let prev_entry = {
+            let mut pending = self.background_approvals.lock().await;
+            pending.insert(turn_id.clone(), tx_approve)
+        };
+        if prev_entry.is_some() {
+            warn!("Overwriting existing background approval for turn_id: {turn_id}");
+        }
+
+        let parsed_cmd = parse_command(&command);
+        let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
+            call_id,
+            turn_id: turn_id.clone(),
+            command,
+            cwd,
+            reason,
+            proposed_execpolicy_amendment,
+            parsed_cmd,
+        });
+        self.send_event_raw(Event {
+            id: turn_id,
+            msg: event,
+        })
+        .await;
+        rx_approve.await.unwrap_or_default()
+    }
+
+    pub(crate) async fn request_patch_approval_background(
+        &self,
+        turn_id: String,
+        call_id: String,
+        changes: HashMap<PathBuf, FileChange>,
+        reason: Option<String>,
+        grant_root: Option<PathBuf>,
+    ) -> oneshot::Receiver<ReviewDecision> {
+        let (tx_approve, rx_approve) = oneshot::channel();
+        let prev_entry = {
+            let mut pending = self.background_approvals.lock().await;
+            pending.insert(turn_id.clone(), tx_approve)
+        };
+        if prev_entry.is_some() {
+            warn!("Overwriting existing background approval for turn_id: {turn_id}");
+        }
+
+        let event = EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
+            call_id,
+            turn_id: turn_id.clone(),
+            changes,
+            reason,
+            grant_root,
+        });
+        self.send_event_raw(Event {
+            id: turn_id,
+            msg: event,
+        })
+        .await;
+        rx_approve
+    }
+
+    pub async fn notify_approval(
+        &self,
+        sub_id: &str,
+        decision: ReviewDecision,
+    ) -> Option<ApprovalScope> {
+        let active_entry = {
             let mut active = self.active_turn.lock().await;
             match active.as_mut() {
                 Some(at) => {
@@ -1091,14 +1176,23 @@ impl Session {
                 None => None,
             }
         };
-        match entry {
-            Some(tx_approve) => {
-                tx_approve.send(decision).ok();
-            }
-            None => {
-                warn!("No pending approval found for sub_id: {sub_id}");
-            }
+
+        if let Some(tx_approve) = active_entry {
+            tx_approve.send(decision).ok();
+            return Some(ApprovalScope::ActiveTurn);
         }
+
+        let background_entry = {
+            let mut pending = self.background_approvals.lock().await;
+            pending.remove(sub_id)
+        };
+        if let Some(tx_approve) = background_entry {
+            tx_approve.send(decision).ok();
+            return Some(ApprovalScope::Background);
+        }
+
+        warn!("No pending approval found for sub_id: {sub_id}");
+        None
     }
 
     pub async fn resolve_elicitation(
@@ -1587,6 +1681,21 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
             Op::ListSkills { cwds } => {
                 handlers::list_skills(&sess, sub.id.clone(), cwds).await;
             }
+            Op::ListSubagents => {
+                handlers::list_subagents(&sess, sub.id.clone()).await;
+            }
+            Op::PollSubagent { agent_id, await_ms } => {
+                handlers::poll_subagent(&sess, sub.id.clone(), agent_id, await_ms).await;
+            }
+            Op::CancelSubagent { agent_id } => {
+                handlers::cancel_subagent(&sess, sub.id.clone(), agent_id).await;
+            }
+            Op::OrchestratePlan { prompt } => {
+                handlers::orchestrate_plan(&sess, sub.id.clone(), prompt);
+            }
+            Op::OrchestrateSolve { prompt } => {
+                handlers::orchestrate_solve(&sess, sub.id.clone(), prompt);
+            }
             Op::Undo => {
                 handlers::undo(&sess, sub.id.clone()).await;
             }
@@ -1625,6 +1734,7 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
 
 /// Operation handlers
 mod handlers {
+    use super::ApprovalScope;
     use crate::codex::Session;
     use crate::codex::SessionSettingsUpdate;
     use crate::codex::TurnContext;
@@ -1640,16 +1750,21 @@ mod handlers {
     use crate::tasks::UndoTask;
     use crate::tasks::UserShellCommandTask;
     use codex_protocol::custom_prompts::CustomPrompt;
+    use codex_protocol::protocol::CancelSubagentResponseEvent;
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::ErrorEvent;
     use codex_protocol::protocol::Event;
     use codex_protocol::protocol::EventMsg;
     use codex_protocol::protocol::ListCustomPromptsResponseEvent;
     use codex_protocol::protocol::ListSkillsResponseEvent;
+    use codex_protocol::protocol::ListSubagentsResponseEvent;
     use codex_protocol::protocol::Op;
+    use codex_protocol::protocol::PollSubagentResponseEvent;
     use codex_protocol::protocol::ReviewDecision;
     use codex_protocol::protocol::ReviewRequest;
     use codex_protocol::protocol::SkillsListEntry;
+    use codex_protocol::protocol::SubagentDetail;
+    use codex_protocol::protocol::SubagentSummary;
     use codex_protocol::protocol::TurnAbortReason;
     use codex_protocol::protocol::WarningEvent;
 
@@ -1787,19 +1902,35 @@ mod handlers {
             .await;
         }
         match decision {
-            ReviewDecision::Abort => {
-                sess.interrupt_task().await;
+            ReviewDecision::Abort => match sess
+                .notify_approval(&id, codex_protocol::protocol::ReviewDecision::Abort)
+                .await
+            {
+                Some(ApprovalScope::ActiveTurn) | None => {
+                    sess.interrupt_task().await;
+                }
+                Some(ApprovalScope::Background) => {}
+            },
+            other => {
+                sess.notify_approval(&id, other).await;
             }
-            other => sess.notify_approval(&id, other).await,
         }
     }
 
     pub async fn patch_approval(sess: &Arc<Session>, id: String, decision: ReviewDecision) {
         match decision {
-            ReviewDecision::Abort => {
-                sess.interrupt_task().await;
+            ReviewDecision::Abort => match sess
+                .notify_approval(&id, codex_protocol::protocol::ReviewDecision::Abort)
+                .await
+            {
+                Some(ApprovalScope::ActiveTurn) | None => {
+                    sess.interrupt_task().await;
+                }
+                Some(ApprovalScope::Background) => {}
+            },
+            other => {
+                sess.notify_approval(&id, other).await;
             }
-            other => sess.notify_approval(&id, other).await,
         }
     }
 
@@ -1920,6 +2051,493 @@ mod handlers {
             msg: EventMsg::ListSkillsResponse(ListSkillsResponseEvent { skills }),
         };
         sess.send_event_raw(event).await;
+    }
+
+    pub async fn list_subagents(sess: &Session, sub_id: String) {
+        let enabled = sess.enabled(Feature::Subagents);
+        let agents = sess.services.subagent_manager.list().await;
+        let subagents: Vec<SubagentSummary> =
+            agents.iter().map(super::subagent_poll_to_summary).collect();
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::ListSubagentsResponse(ListSubagentsResponseEvent { enabled, subagents }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
+    pub async fn poll_subagent(
+        sess: &Session,
+        sub_id: String,
+        agent_id: String,
+        await_ms: Option<u64>,
+    ) {
+        let Some(poll) = sess
+            .services
+            .subagent_manager
+            .poll(&agent_id, await_ms)
+            .await
+        else {
+            let event = Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "unknown agent_id".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            };
+            sess.send_event_raw(event).await;
+            return;
+        };
+        let subagent: SubagentDetail = super::subagent_poll_to_detail(poll);
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::PollSubagentResponse(PollSubagentResponseEvent { subagent }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
+    pub async fn cancel_subagent(sess: &Session, sub_id: String, agent_id: String) {
+        if sess
+            .services
+            .subagent_manager
+            .cancel(&agent_id)
+            .await
+            .is_none()
+        {
+            let event = Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: "unknown agent_id".to_string(),
+                    codex_error_info: Some(CodexErrorInfo::Other),
+                }),
+            };
+            sess.send_event_raw(event).await;
+            return;
+        }
+        let event = Event {
+            id: sub_id,
+            msg: EventMsg::CancelSubagentResponse(CancelSubagentResponseEvent { agent_id }),
+        };
+        sess.send_event_raw(event).await;
+    }
+
+    pub fn orchestrate_plan(sess: &Arc<Session>, sub_id: String, prompt: String) {
+        let parent_session = Arc::clone(sess);
+        tokio::spawn(async move {
+            if !parent_session.enabled(Feature::Subagents) {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "subagents feature is disabled (enable with `--enable subagents`)"
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let prompt = prompt.trim().to_string();
+            if prompt.is_empty() {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "plan prompt must be non-empty".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let parent_turn = parent_session
+                .new_turn(SessionSettingsUpdate::default())
+                .await;
+            let parent_config = parent_turn.client.config().as_ref().clone();
+            let orchestration_timeout = parent_config.subagents.orchestration_timeout;
+            let orchestration_timeout_ms =
+                u64::try_from(orchestration_timeout.as_millis()).unwrap_or(u64::MAX);
+            let max_output_chars = parent_config.subagents.max_output_chars;
+            let mut subagent_config = parent_config.clone();
+            // Ensure orchestration runs unattended: avoid tools that can block on approvals.
+            subagent_config
+                .features
+                .disable(Feature::ShellTool)
+                .disable(Feature::UnifiedExec)
+                .disable(Feature::ApplyPatchFreeform)
+                .disable(Feature::WebSearchRequest)
+                .disable(Feature::ViewImageTool)
+                .disable(Feature::ShellSnapshot);
+
+            let auth_manager = parent_session.services.auth_manager.clone();
+            let models_manager = parent_session.services.models_manager.clone();
+            let skills_manager = parent_session.services.skills_manager.clone();
+            let subagent_manager = parent_session.services.subagent_manager.clone();
+
+            let roles: [(&str, &str); 3] = [
+                (
+                    "scout",
+                    "Scan the repo quickly and list the key files/areas relevant to the goal.",
+                ),
+                (
+                    "planner",
+                    "Produce a step-by-step implementation plan with file pointers and tests.",
+                ),
+                (
+                    "critic",
+                    "Review the plan for risks/missing cases and suggest improvements.",
+                ),
+            ];
+
+            let mut spawned: Vec<(String, String)> = Vec::new();
+
+            let started_at = std::time::Instant::now();
+            for (role, role_instruction) in roles {
+                let label = format!("plan-{role}");
+                let role_prompt = format!(
+                    "Goal:\n{prompt}\n\nTask:\n{role_instruction}\n\nOutput requirements:\n- Be concise.\n- Include concrete file paths and commands where useful.\n- Do not call shell/unified_exec/apply_patch.\n- If you need repo info, use read_file/list_dir/grep_files.\n"
+                );
+                match subagent_manager
+                    .spawn_one_shot(
+                        crate::subagents::SubagentSpawnRequest {
+                            agent_id: None,
+                            mode: crate::subagents::SubagentMode::Explore,
+                            label: label.clone(),
+                            prompt: role_prompt,
+                            skills: Vec::new(),
+                            timeout_ms: Some(orchestration_timeout_ms),
+                            resume_rollout_path: None,
+                        },
+                        Arc::clone(&parent_session),
+                        Arc::clone(&parent_turn),
+                        auth_manager.clone(),
+                        models_manager.clone(),
+                        skills_manager.clone(),
+                        subagent_config.clone(),
+                    )
+                    .await
+                {
+                    Ok(resp) => spawned.push((label, resp.agent_id)),
+                    Err(e) => {
+                        let event = Event {
+                            id: sub_id.clone(),
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: format!("failed to spawn planning subagent {label}: {e}"),
+                                codex_error_info: Some(CodexErrorInfo::Other),
+                            }),
+                        };
+                        parent_session.send_event_raw(event).await;
+                        return;
+                    }
+                }
+            }
+
+            let started_message = spawned
+                .iter()
+                .map(|(label, agent_id)| format!("- {label}: {agent_id}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let event = Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Started multi-agent plan (experimental).\n\nUse `/subagents` (default TUI) to inspect/cancel.\n\n{started_message}"
+                    ),
+                }),
+            };
+            parent_session.send_event_raw(event).await;
+
+            let mut outputs: Vec<(String, String)> = Vec::new();
+            let deadline = started_at + orchestration_timeout;
+            for (label, agent_id) in spawned {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or(std::time::Duration::ZERO);
+                let await_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                let poll = if await_ms == 0 {
+                    subagent_manager.poll(&agent_id, None).await
+                } else {
+                    subagent_manager.poll(&agent_id, Some(await_ms)).await
+                };
+
+                let mut out = poll
+                    .as_ref()
+                    .and_then(|p| p.final_output.clone())
+                    .unwrap_or_else(|| match poll.as_ref().map(|p| p.status) {
+                        Some(crate::subagents::SubagentStatus::Queued)
+                        | Some(crate::subagents::SubagentStatus::Running) => format!(
+                            "(still running after {}s; check /subagents or increase [subagents].orchestration_timeout_ms)",
+                            orchestration_timeout.as_secs()
+                        ),
+                        Some(crate::subagents::SubagentStatus::Aborted) => "(cancelled)".to_string(),
+                        Some(crate::subagents::SubagentStatus::Error) => {
+                            "(error; check /subagents for details)".to_string()
+                        }
+                        Some(crate::subagents::SubagentStatus::Complete) | None => {
+                            "(no output)".to_string()
+                        }
+                    });
+
+                if matches!(
+                    poll.as_ref().map(|p| p.status),
+                    Some(crate::subagents::SubagentStatus::Queued)
+                        | Some(crate::subagents::SubagentStatus::Running)
+                ) {
+                    let _ = subagent_manager.cancel(&agent_id).await;
+                }
+
+                out = codex_utils_string::take_bytes_at_char_boundary(&out, max_output_chars)
+                    .to_string();
+                outputs.push((label, out));
+            }
+            outputs.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut report = String::new();
+            report.push_str("Multi-agent plan (experimental)\n\n");
+            report.push_str("Goal:\n");
+            report.push_str(&prompt);
+            report.push_str("\n\n");
+            for (label, out) in &outputs {
+                report.push_str(&format!("{label}:\n"));
+                report.push_str(out.trim());
+                report.push_str("\n\n");
+            }
+
+            let has_active_turn = { parent_session.active_turn.lock().await.is_some() };
+            let msg = if has_active_turn {
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "{report}\n(use `/subagents` (default TUI) for rollout paths and logs)"
+                    ),
+                })
+            } else {
+                EventMsg::AgentMessage(codex_protocol::protocol::AgentMessageEvent {
+                    message: format!(
+                        "### Multi-agent plan (experimental)\n\n**Goal**\n{prompt}\n\n{}",
+                        outputs
+                            .iter()
+                            .map(|(label, out)| {
+                                let title = label.replace('-', " ");
+                                format!("#### {title}\n\n{}\n", out.trim())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                })
+            };
+
+            let event = Event { id: sub_id, msg };
+            parent_session.send_event_raw(event).await;
+        });
+    }
+
+    pub fn orchestrate_solve(sess: &Arc<Session>, sub_id: String, prompt: String) {
+        let parent_session = Arc::clone(sess);
+        tokio::spawn(async move {
+            if !parent_session.enabled(Feature::Subagents) {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "subagents feature is disabled (enable with `--enable subagents`)"
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let prompt = prompt.trim().to_string();
+            if prompt.is_empty() {
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "solve prompt must be non-empty".to_string(),
+                        codex_error_info: Some(CodexErrorInfo::Other),
+                    }),
+                };
+                parent_session.send_event_raw(event).await;
+                return;
+            }
+
+            let parent_turn = parent_session
+                .new_turn(SessionSettingsUpdate::default())
+                .await;
+            let parent_config = parent_turn.client.config().as_ref().clone();
+            let orchestration_timeout = parent_config.subagents.orchestration_timeout;
+            let orchestration_timeout_ms =
+                u64::try_from(orchestration_timeout.as_millis()).unwrap_or(u64::MAX);
+            let max_output_chars = parent_config.subagents.max_output_chars;
+            let mut subagent_config = parent_config.clone();
+            // Ensure orchestration runs unattended: avoid tools that can block on approvals.
+            subagent_config
+                .features
+                .disable(Feature::ShellTool)
+                .disable(Feature::UnifiedExec)
+                .disable(Feature::ApplyPatchFreeform)
+                .disable(Feature::WebSearchRequest)
+                .disable(Feature::ViewImageTool)
+                .disable(Feature::ShellSnapshot);
+
+            let auth_manager = parent_session.services.auth_manager.clone();
+            let models_manager = parent_session.services.models_manager.clone();
+            let skills_manager = parent_session.services.skills_manager.clone();
+            let subagent_manager = parent_session.services.subagent_manager.clone();
+
+            let roles: [(&str, &str); 3] = [
+                (
+                    "scout",
+                    "Scan the repo quickly and list the key files/areas and likely constraints relevant to the task.",
+                ),
+                (
+                    "solver",
+                    "Propose a concrete solution approach. Include specific file paths and commands to run, but do not apply changes.",
+                ),
+                (
+                    "critic",
+                    "Critique the proposed approach: risks, edge cases, tests to add, and better alternatives.",
+                ),
+            ];
+
+            let mut spawned: Vec<(String, String)> = Vec::new();
+
+            let started_at = std::time::Instant::now();
+            for (role, role_instruction) in roles {
+                let label = format!("solve-{role}");
+                let role_prompt = format!(
+                    "Task:\n{prompt}\n\nRole:\n{role_instruction}\n\nOutput requirements:\n- Be concise.\n- Prefer actionable steps over commentary.\n- Do not call shell/unified_exec/apply_patch.\n- If you need repo info, use read_file/list_dir/grep_files.\n"
+                );
+                match subagent_manager
+                    .spawn_one_shot(
+                        crate::subagents::SubagentSpawnRequest {
+                            agent_id: None,
+                            mode: crate::subagents::SubagentMode::Explore,
+                            label: label.clone(),
+                            prompt: role_prompt,
+                            skills: Vec::new(),
+                            timeout_ms: Some(orchestration_timeout_ms),
+                            resume_rollout_path: None,
+                        },
+                        Arc::clone(&parent_session),
+                        Arc::clone(&parent_turn),
+                        auth_manager.clone(),
+                        models_manager.clone(),
+                        skills_manager.clone(),
+                        subagent_config.clone(),
+                    )
+                    .await
+                {
+                    Ok(resp) => spawned.push((label, resp.agent_id)),
+                    Err(e) => {
+                        let event = Event {
+                            id: sub_id.clone(),
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: format!("failed to spawn solving subagent {label}: {e}"),
+                                codex_error_info: Some(CodexErrorInfo::Other),
+                            }),
+                        };
+                        parent_session.send_event_raw(event).await;
+                        return;
+                    }
+                }
+            }
+
+            let started_message = spawned
+                .iter()
+                .map(|(label, agent_id)| format!("- {label}: {agent_id}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let event = Event {
+                id: sub_id.clone(),
+                msg: EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Started multi-agent solve (experimental).\n\nUse `/subagents` (default TUI) to inspect/cancel.\n\n{started_message}"
+                    ),
+                }),
+            };
+            parent_session.send_event_raw(event).await;
+
+            let mut outputs: Vec<(String, String)> = Vec::new();
+            let deadline = started_at + orchestration_timeout;
+            for (label, agent_id) in spawned {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or(std::time::Duration::ZERO);
+                let await_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                let poll = if await_ms == 0 {
+                    subagent_manager.poll(&agent_id, None).await
+                } else {
+                    subagent_manager.poll(&agent_id, Some(await_ms)).await
+                };
+
+                let mut out = poll
+                    .as_ref()
+                    .and_then(|p| p.final_output.clone())
+                    .unwrap_or_else(|| match poll.as_ref().map(|p| p.status) {
+                        Some(crate::subagents::SubagentStatus::Queued)
+                        | Some(crate::subagents::SubagentStatus::Running) => format!(
+                            "(still running after {}s; check /subagents or increase [subagents].orchestration_timeout_ms)",
+                            orchestration_timeout.as_secs()
+                        ),
+                        Some(crate::subagents::SubagentStatus::Aborted) => "(cancelled)".to_string(),
+                        Some(crate::subagents::SubagentStatus::Error) => {
+                            "(error; check /subagents for details)".to_string()
+                        }
+                        Some(crate::subagents::SubagentStatus::Complete) | None => {
+                            "(no output)".to_string()
+                        }
+                    });
+
+                if matches!(
+                    poll.as_ref().map(|p| p.status),
+                    Some(crate::subagents::SubagentStatus::Queued)
+                        | Some(crate::subagents::SubagentStatus::Running)
+                ) {
+                    let _ = subagent_manager.cancel(&agent_id).await;
+                }
+
+                out = codex_utils_string::take_bytes_at_char_boundary(&out, max_output_chars)
+                    .to_string();
+                outputs.push((label, out));
+            }
+            outputs.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let mut report = String::new();
+            report.push_str("Multi-agent solve (experimental)\n\n");
+            report.push_str("Task:\n");
+            report.push_str(&prompt);
+            report.push_str("\n\n");
+            for (label, out) in &outputs {
+                report.push_str(&format!("{label}:\n"));
+                report.push_str(out.trim());
+                report.push_str("\n\n");
+            }
+
+            let has_active_turn = { parent_session.active_turn.lock().await.is_some() };
+            let msg = if has_active_turn {
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "{report}\n(use `/subagents` (default TUI) for rollout paths and logs)"
+                    ),
+                })
+            } else {
+                EventMsg::AgentMessage(codex_protocol::protocol::AgentMessageEvent {
+                    message: format!(
+                        "### Multi-agent solve (experimental)\n\n**Task**\n{prompt}\n\n{}",
+                        outputs
+                            .iter()
+                            .map(|(label, out)| {
+                                let title = label.replace('-', " ");
+                                format!("#### {title}\n\n{}\n", out.trim())
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                })
+            };
+
+            let event = Event { id: sub_id, msg };
+            parent_session.send_event_raw(event).await;
+        });
     }
 
     pub async fn undo(sess: &Arc<Session>, sub_id: String) {
@@ -2115,6 +2733,60 @@ fn skills_to_info(skills: &[SkillMetadata]) -> Vec<ProtocolSkillMetadata> {
             scope: skill.scope,
         })
         .collect()
+}
+
+fn subagent_mode_to_info(
+    mode: crate::subagents::SubagentMode,
+) -> codex_protocol::protocol::SubagentMode {
+    match mode {
+        crate::subagents::SubagentMode::Explore => codex_protocol::protocol::SubagentMode::Explore,
+        crate::subagents::SubagentMode::General => codex_protocol::protocol::SubagentMode::General,
+    }
+}
+
+fn subagent_status_to_info(
+    status: crate::subagents::SubagentStatus,
+) -> codex_protocol::protocol::SubagentStatus {
+    match status {
+        crate::subagents::SubagentStatus::Queued => {
+            codex_protocol::protocol::SubagentStatus::Queued
+        }
+        crate::subagents::SubagentStatus::Running => {
+            codex_protocol::protocol::SubagentStatus::Running
+        }
+        crate::subagents::SubagentStatus::Complete => {
+            codex_protocol::protocol::SubagentStatus::Complete
+        }
+        crate::subagents::SubagentStatus::Aborted => {
+            codex_protocol::protocol::SubagentStatus::Aborted
+        }
+        crate::subagents::SubagentStatus::Error => codex_protocol::protocol::SubagentStatus::Error,
+    }
+}
+
+fn subagent_poll_to_summary(
+    poll: &crate::subagents::SubagentPollResponse,
+) -> codex_protocol::protocol::SubagentSummary {
+    codex_protocol::protocol::SubagentSummary {
+        agent_id: poll.agent_id.clone(),
+        status: subagent_status_to_info(poll.status),
+        label: poll.label.clone(),
+        mode: subagent_mode_to_info(poll.mode),
+    }
+}
+
+fn subagent_poll_to_detail(
+    poll: crate::subagents::SubagentPollResponse,
+) -> codex_protocol::protocol::SubagentDetail {
+    codex_protocol::protocol::SubagentDetail {
+        agent_id: poll.agent_id,
+        status: subagent_status_to_info(poll.status),
+        label: poll.label,
+        mode: subagent_mode_to_info(poll.mode),
+        rollout_path: poll.rollout_path,
+        final_output: poll.final_output,
+        recent_events: poll.recent_events,
+    }
 }
 
 fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
@@ -3090,6 +3762,7 @@ mod tests {
             models_manager,
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
+            subagent_manager: Arc::new(crate::subagents::SubagentManager::default()),
         };
 
         let turn_context = Session::make_turn_context(
@@ -3109,6 +3782,7 @@ mod tests {
             state: Mutex::new(state),
             features: config.features.clone(),
             active_turn: Mutex::new(None),
+            background_approvals: Mutex::new(HashMap::new()),
             services,
             next_internal_sub_id: AtomicU64::new(0),
         };
@@ -3181,6 +3855,7 @@ mod tests {
             models_manager,
             tool_approvals: Mutex::new(ApprovalStore::default()),
             skills_manager,
+            subagent_manager: Arc::new(crate::subagents::SubagentManager::default()),
         };
 
         let turn_context = Arc::new(Session::make_turn_context(
@@ -3200,6 +3875,7 @@ mod tests {
             state: Mutex::new(state),
             features: config.features.clone(),
             active_turn: Mutex::new(None),
+            background_approvals: Mutex::new(HashMap::new()),
             services,
             next_internal_sub_id: AtomicU64::new(0),
         });

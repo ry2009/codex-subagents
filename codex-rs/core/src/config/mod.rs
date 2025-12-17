@@ -1,5 +1,11 @@
 use crate::auth::AuthCredentialsStoreMode;
 use crate::config::types::DEFAULT_OTEL_ENVIRONMENT;
+use crate::config::types::DEFAULT_SUBAGENTS_MAX_AGENTS;
+use crate::config::types::DEFAULT_SUBAGENTS_MAX_EVENT_CHARS;
+use crate::config::types::DEFAULT_SUBAGENTS_MAX_EVENTS;
+use crate::config::types::DEFAULT_SUBAGENTS_MAX_OUTPUT_CHARS;
+use crate::config::types::DEFAULT_SUBAGENTS_ORCHESTRATION_TIMEOUT_MS;
+use crate::config::types::DEFAULT_SUBAGENTS_TIMEOUT_MS;
 use crate::config::types::History;
 use crate::config::types::McpServerConfig;
 use crate::config::types::Notice;
@@ -10,6 +16,8 @@ use crate::config::types::OtelExporterKind;
 use crate::config::types::SandboxWorkspaceWrite;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::config::types::ShellEnvironmentPolicyToml;
+use crate::config::types::SubagentsConfig;
+use crate::config::types::SubagentsConfigToml;
 use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
 use crate::config_loader::load_config_layers_state;
@@ -273,6 +281,9 @@ pub struct Config {
 
     /// Centralized feature flags; source of truth for feature gating.
     pub features: Features,
+
+    /// Subagent orchestration and budgeting settings.
+    pub subagents: SubagentsConfig,
 
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
@@ -666,6 +677,9 @@ pub struct ConfigToml {
     /// Settings for ghost snapshots (used for undo).
     #[serde(default)]
     pub ghost_snapshot: Option<GhostSnapshotToml>,
+    /// Subagent resource/budget settings.
+    #[serde(default)]
+    pub subagents: Option<SubagentsConfigToml>,
 
     /// When `true`, checks for Codex updates on startup and surfaces update prompts.
     /// Set to `false` only if your Codex updates are centrally managed.
@@ -1148,6 +1162,50 @@ impl Config {
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
 
+        let subagents = {
+            let toml = cfg.subagents.as_ref();
+
+            let default_timeout = std::time::Duration::from_millis(DEFAULT_SUBAGENTS_TIMEOUT_MS);
+            let orchestration_timeout =
+                std::time::Duration::from_millis(DEFAULT_SUBAGENTS_ORCHESTRATION_TIMEOUT_MS);
+
+            SubagentsConfig {
+                max_concurrency: toml.and_then(|t| t.max_concurrency).map(|v| v.clamp(1, 64)),
+                max_agents: toml
+                    .and_then(|t| t.max_agents)
+                    .unwrap_or(DEFAULT_SUBAGENTS_MAX_AGENTS)
+                    .clamp(1, 4096),
+                default_timeout: toml
+                    .and_then(|t| t.default_timeout_ms)
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(default_timeout)
+                    .clamp(
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(24 * 60 * 60),
+                    ),
+                orchestration_timeout: toml
+                    .and_then(|t| t.orchestration_timeout_ms)
+                    .map(std::time::Duration::from_millis)
+                    .unwrap_or(orchestration_timeout)
+                    .clamp(
+                        std::time::Duration::from_secs(1),
+                        std::time::Duration::from_secs(60 * 60),
+                    ),
+                max_events: toml
+                    .and_then(|t| t.max_events)
+                    .unwrap_or(DEFAULT_SUBAGENTS_MAX_EVENTS)
+                    .clamp(1, 1024),
+                max_event_chars: toml
+                    .and_then(|t| t.max_event_chars)
+                    .unwrap_or(DEFAULT_SUBAGENTS_MAX_EVENT_CHARS)
+                    .clamp(256, 256 * 1024),
+                max_output_chars: toml
+                    .and_then(|t| t.max_output_chars)
+                    .unwrap_or(DEFAULT_SUBAGENTS_MAX_OUTPUT_CHARS)
+                    .clamp(1024, 1024 * 1024),
+            }
+        };
+
         let config = Self {
             model,
             review_model,
@@ -1221,6 +1279,7 @@ impl Config {
             use_experimental_use_rmcp_client,
             ghost_snapshot,
             features,
+            subagents,
             active_profile: active_profile_name,
             active_project,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
@@ -1363,6 +1422,20 @@ mod tests {
 
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn default_subagents_config() -> SubagentsConfig {
+        SubagentsConfig {
+            max_concurrency: None,
+            max_agents: DEFAULT_SUBAGENTS_MAX_AGENTS,
+            default_timeout: Duration::from_millis(DEFAULT_SUBAGENTS_TIMEOUT_MS),
+            orchestration_timeout: Duration::from_millis(
+                DEFAULT_SUBAGENTS_ORCHESTRATION_TIMEOUT_MS,
+            ),
+            max_events: DEFAULT_SUBAGENTS_MAX_EVENTS,
+            max_event_chars: DEFAULT_SUBAGENTS_MAX_EVENT_CHARS,
+            max_output_chars: DEFAULT_SUBAGENTS_MAX_OUTPUT_CHARS,
+        }
+    }
 
     #[test]
     fn test_toml_parsing() {
@@ -2983,6 +3056,7 @@ model_verbosity = "high"
                 use_experimental_use_rmcp_client: false,
                 ghost_snapshot: GhostSnapshotConfig::default(),
                 features: Features::with_defaults(),
+                subagents: default_subagents_config(),
                 active_profile: Some("o3".to_string()),
                 active_project: ProjectConfig { trust_level: None },
                 windows_wsl_setup_acknowledged: false,
@@ -3058,6 +3132,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            subagents: default_subagents_config(),
             active_profile: Some("gpt3".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -3148,6 +3223,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            subagents: default_subagents_config(),
             active_profile: Some("zdr".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
@@ -3224,6 +3300,7 @@ model_verbosity = "high"
             use_experimental_use_rmcp_client: false,
             ghost_snapshot: GhostSnapshotConfig::default(),
             features: Features::with_defaults(),
+            subagents: default_subagents_config(),
             active_profile: Some("gpt5".to_string()),
             active_project: ProjectConfig { trust_level: None },
             windows_wsl_setup_acknowledged: false,
