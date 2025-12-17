@@ -22,6 +22,7 @@ use codex_core::protocol::AgentReasoningRawContentDeltaEvent;
 use codex_core::protocol::AgentReasoningRawContentEvent;
 use codex_core::protocol::ApplyPatchApprovalRequestEvent;
 use codex_core::protocol::BackgroundEventEvent;
+use codex_core::protocol::CancelSubagentResponseEvent;
 use codex_core::protocol::CreditsSnapshot;
 use codex_core::protocol::DeprecationNoticeEvent;
 use codex_core::protocol::ErrorEvent;
@@ -34,6 +35,7 @@ use codex_core::protocol::ExecCommandSource;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
 use codex_core::protocol::ListSkillsResponseEvent;
+use codex_core::protocol::ListSubagentsResponseEvent;
 use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpStartupCompleteEvent;
 use codex_core::protocol::McpStartupStatus;
@@ -42,11 +44,14 @@ use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::PatchApplyBeginEvent;
+use codex_core::protocol::PollSubagentResponseEvent;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_core::protocol::ReviewRequest;
 use codex_core::protocol::ReviewTarget;
 use codex_core::protocol::SkillsListEntry;
 use codex_core::protocol::StreamErrorEvent;
+use codex_core::protocol::SubagentMode;
+use codex_core::protocol::SubagentStatus;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TerminalInteractionEvent;
 use codex_core::protocol::TokenUsage;
@@ -132,6 +137,7 @@ use codex_common::approval_presets::builtin_approval_presets;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::ConversationManager;
+use codex_core::features::Feature;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
 use codex_file_search::FileMatch;
@@ -334,6 +340,8 @@ pub(crate) struct ChatWidget {
     feedback: codex_feedback::CodexFeedback,
     // Current session rollout path (if known)
     current_rollout_path: Option<PathBuf>,
+    // Whether to open the subagents popup when a ListSubagentsResponse arrives.
+    open_subagents_popup_on_next_list: bool,
 }
 
 struct UserMessage {
@@ -1336,6 +1344,7 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            open_subagents_popup_on_next_list: false,
         };
 
         widget.prefetch_rate_limits();
@@ -1421,6 +1430,7 @@ impl ChatWidget {
             last_rendered_width: std::cell::Cell::new(None),
             feedback,
             current_rollout_path: None,
+            open_subagents_popup_on_next_list: false,
         };
 
         widget.prefetch_rate_limits();
@@ -1495,8 +1505,8 @@ impl ChatWidget {
                         };
                         self.queue_user_message(user_message);
                     }
-                    InputResult::Command(cmd) => {
-                        self.dispatch_command(cmd);
+                    InputResult::Command(cmd, args) => {
+                        self.dispatch_command(cmd, args);
                     }
                     InputResult::None => {}
                 }
@@ -1519,7 +1529,7 @@ impl ChatWidget {
         self.request_redraw();
     }
 
-    fn dispatch_command(&mut self, cmd: SlashCommand) {
+    fn dispatch_command(&mut self, cmd: SlashCommand, args: String) {
         if !cmd.available_during_task() && self.bottom_pane.is_task_running() {
             let message = format!(
                 "'/{}' is disabled while a task is in progress.",
@@ -1561,6 +1571,50 @@ impl ChatWidget {
             }
             SlashCommand::Review => {
                 self.open_review_popup();
+            }
+            SlashCommand::Plan => {
+                let task = args.trim();
+                if task.is_empty() {
+                    self.add_info_message("Usage: /plan <task>".to_string(), None);
+                    return;
+                }
+
+                if self.config.features.enabled(Feature::Subagents) {
+                    self.app_event_tx
+                        .send(AppEvent::CodexOp(Op::OrchestratePlan {
+                            prompt: task.to_string(),
+                        }));
+                    return;
+                }
+
+                let prompt = format!(
+                    "Create a concise implementation plan for this task.\n\
+\n\
+Task:\n\
+{task}\n\
+\n\
+Constraints:\n\
+- Do not run shell commands or apply patches.\n\
+- Call update_plan with 5–8 steps (exactly one in_progress).\n"
+                );
+                self.submit_user_message(prompt.into());
+            }
+            SlashCommand::Solve => {
+                let task = args.trim();
+                if task.is_empty() {
+                    self.add_info_message("Usage: /solve <task>".to_string(), None);
+                    return;
+                }
+
+                if self.config.features.enabled(Feature::Subagents) {
+                    self.app_event_tx
+                        .send(AppEvent::CodexOp(Op::OrchestrateSolve {
+                            prompt: task.to_string(),
+                        }));
+                    return;
+                }
+
+                self.submit_user_message(task.to_string().into());
             }
             SlashCommand::Model => {
                 self.open_model_popup();
@@ -1605,6 +1659,9 @@ impl ChatWidget {
             }
             SlashCommand::Skills => {
                 self.insert_str("$");
+            }
+            SlashCommand::Subagents => {
+                self.open_subagents_popup();
             }
             SlashCommand::Status => {
                 self.add_status_output();
@@ -1886,6 +1943,9 @@ impl ChatWidget {
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
             EventMsg::ListSkillsResponse(ev) => self.on_list_skills(ev),
+            EventMsg::ListSubagentsResponse(ev) => self.on_list_subagents(ev),
+            EventMsg::PollSubagentResponse(ev) => self.on_poll_subagent_response(ev),
+            EventMsg::CancelSubagentResponse(ev) => self.on_cancel_subagent_response(ev),
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::DeprecationNotice(ev) => self.on_deprecation_notice(ev),
@@ -3101,6 +3161,210 @@ impl ChatWidget {
 
     fn on_list_skills(&mut self, ev: ListSkillsResponseEvent) {
         self.set_skills_from_response(&ev);
+    }
+
+    fn subagent_mode_str(mode: SubagentMode) -> &'static str {
+        match mode {
+            SubagentMode::Explore => "explore",
+            SubagentMode::General => "general",
+        }
+    }
+
+    fn subagent_status_str(status: SubagentStatus) -> &'static str {
+        match status {
+            SubagentStatus::Queued => "queued",
+            SubagentStatus::Running => "running",
+            SubagentStatus::Complete => "complete",
+            SubagentStatus::Aborted => "aborted",
+            SubagentStatus::Error => "error",
+        }
+    }
+
+    fn on_list_subagents(&mut self, ev: ListSubagentsResponseEvent) {
+        if !self.open_subagents_popup_on_next_list {
+            return;
+        }
+        self.open_subagents_popup_on_next_list = false;
+
+        let ListSubagentsResponseEvent {
+            enabled,
+            mut subagents,
+        } = ev;
+
+        fn status_rank(status: SubagentStatus) -> u8 {
+            match status {
+                SubagentStatus::Running => 0,
+                SubagentStatus::Queued => 1,
+                SubagentStatus::Complete => 2,
+                SubagentStatus::Error => 3,
+                SubagentStatus::Aborted => 4,
+            }
+        }
+
+        subagents.sort_by(|a, b| {
+            status_rank(a.status)
+                .cmp(&status_rank(b.status))
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.agent_id.cmp(&b.agent_id))
+        });
+
+        let initial_selected_idx = subagents
+            .iter()
+            .position(|s| matches!(s.status, SubagentStatus::Running))
+            .or_else(|| (!subagents.is_empty()).then_some(0));
+
+        let subtitle = if !enabled {
+            Some(
+                "Subagents are disabled (enable with `--enable subagents` or `[features] subagents = true`)."
+                    .to_string(),
+            )
+        } else if subagents.is_empty() {
+            Some("No subagents for this session yet.".to_string())
+        } else {
+            Some("Select a subagent to manage.".to_string())
+        };
+
+        let items: Vec<SelectionItem> = if subagents.is_empty() {
+            vec![SelectionItem {
+                name: "No subagents".to_string(),
+                description: Some(
+                    "Tip: ask Codex to use `delegate` or `subagent_spawn` for background work."
+                        .to_string(),
+                ),
+                dismiss_on_select: true,
+                ..Default::default()
+            }]
+        } else {
+            subagents
+                .into_iter()
+                .map(|subagent| {
+                    let agent_id = subagent.agent_id;
+                    let label = subagent.label;
+                    let mode = subagent.mode;
+                    let status = subagent.status;
+
+                    let mode_str = Self::subagent_mode_str(mode);
+                    let status_str = Self::subagent_status_str(status);
+                    let search_value = format!("{label} {agent_id} {mode_str} {status_str}");
+
+                    SelectionItem {
+                        name: format!("{label} — {status_str}"),
+                        description: Some(format!("{agent_id} • {mode_str}")),
+                        selected_description: Some(format!(
+                            "id: {agent_id} • mode: {mode_str} • status: {status_str}"
+                        )),
+                        actions: vec![Box::new(move |tx: &AppEventSender| {
+                            tx.send(AppEvent::OpenSubagentActions {
+                                agent_id: agent_id.clone(),
+                                label: label.clone(),
+                                mode,
+                                status,
+                            });
+                        })],
+                        dismiss_on_select: true,
+                        search_value: Some(search_value),
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        };
+
+        let params = SelectionViewParams {
+            title: Some("Subagents".to_string()),
+            subtitle,
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            is_searchable: true,
+            search_placeholder: Some("filter by id/label".to_string()),
+            header: Box::new(()),
+            initial_selected_idx,
+        };
+
+        self.bottom_pane.show_selection_view(params);
+        self.request_redraw();
+    }
+
+    fn on_poll_subagent_response(&mut self, ev: PollSubagentResponseEvent) {
+        self.add_to_history(history_cell::new_subagent_poll_output(ev.subagent));
+        self.request_redraw();
+    }
+
+    fn on_cancel_subagent_response(&mut self, ev: CancelSubagentResponseEvent) {
+        self.add_info_message(
+            format!("Cancel requested for subagent {}", ev.agent_id),
+            Some("Poll to confirm it stopped.".to_string()),
+        );
+    }
+
+    pub(crate) fn open_subagents_popup(&mut self) {
+        self.open_subagents_popup_on_next_list = true;
+        self.submit_op(Op::ListSubagents);
+    }
+
+    pub(crate) fn open_subagent_actions_popup(
+        &mut self,
+        agent_id: String,
+        label: String,
+        mode: SubagentMode,
+        status: SubagentStatus,
+    ) {
+        let mode_str = Self::subagent_mode_str(mode);
+        let status_str = Self::subagent_status_str(status);
+
+        let poll_item = SelectionItem {
+            name: "Poll".to_string(),
+            description: Some("Fetch latest status/output".to_string()),
+            actions: vec![Box::new({
+                let agent_id = agent_id.clone();
+                move |tx: &AppEventSender| {
+                    tx.send(AppEvent::CodexOp(Op::PollSubagent {
+                        agent_id: agent_id.clone(),
+                        await_ms: Some(0),
+                    }));
+                }
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        };
+
+        let cancel_item = SelectionItem {
+            name: "Cancel".to_string(),
+            description: Some("Request cancellation".to_string()),
+            actions: vec![Box::new({
+                let agent_id = agent_id.clone();
+                move |tx: &AppEventSender| {
+                    tx.send(AppEvent::CodexOp(Op::CancelSubagent {
+                        agent_id: agent_id.clone(),
+                    }));
+                }
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        };
+
+        let back_item = SelectionItem {
+            name: "Back".to_string(),
+            description: Some("Return to the subagent list".to_string()),
+            actions: vec![Box::new(move |tx: &AppEventSender| {
+                tx.send(AppEvent::OpenSubagentsPopup);
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        };
+
+        let params = SelectionViewParams {
+            title: Some(format!("Subagent: {label}")),
+            subtitle: Some(format!("{agent_id} • {mode_str} • {status_str}")),
+            footer_hint: Some(standard_popup_hint_line()),
+            items: vec![poll_item, cancel_item, back_item],
+            is_searchable: false,
+            search_placeholder: None,
+            header: Box::new(()),
+            initial_selected_idx: Some(0),
+        };
+
+        self.bottom_pane.show_selection_view(params);
+        self.request_redraw();
     }
 
     pub(crate) fn open_review_popup(&mut self) {
