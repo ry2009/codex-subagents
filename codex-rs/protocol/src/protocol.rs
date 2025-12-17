@@ -186,6 +186,30 @@ pub enum Op {
     /// Request the list of available custom prompts.
     ListCustomPrompts,
 
+    /// Request the list of available custom agents.
+    ListCustomAgents,
+
+    /// Spawn a custom agent as a background subagent.
+    ///
+    /// When `wait` is set, Codex will also emit an `AgentMessage` once the
+    /// subagent completes (or errors).
+    RunCustomAgent {
+        /// Name of the agent from `.codex/agents/*.md` or `$CODEX_HOME/agents/*.md`.
+        name: String,
+
+        /// The task for the agent.
+        prompt: String,
+
+        /// When set, wait for completion and emit an `AgentMessage` with the final output.
+        #[serde(default)]
+        wait: bool,
+
+        /// Optional deadline for the agent run (milliseconds). When unset, the
+        /// server uses the configured subagent default timeout.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+
     /// Request the list of skills for the provided `cwd` values or the session default.
     ListSkills {
         /// Working directories to scope repo skills discovery.
@@ -638,6 +662,9 @@ pub enum EventMsg {
 
     /// List of custom prompts available to the agent.
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
+
+    /// List of custom agents available to the agent.
+    ListCustomAgentsResponse(ListCustomAgentsResponseEvent),
 
     /// List of skills available to the agent.
     ListSkillsResponse(ListSkillsResponseEvent),
@@ -1711,6 +1738,53 @@ impl fmt::Display for McpAuthStatus {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ListCustomPromptsResponseEvent {
     pub custom_prompts: Vec<CustomPrompt>,
+}
+
+/// Response payload for `Op::ListCustomAgents`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct ListCustomAgentsResponseEvent {
+    pub enabled: bool,
+    pub agents: Vec<CustomAgentMetadata>,
+    pub errors: Vec<CustomAgentErrorInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CustomAgentScope {
+    User,
+    Repo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum CustomAgentToolsPolicy {
+    Inherit,
+    None,
+    Allowlist,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CustomAgentMetadata {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub path: PathBuf,
+    pub scope: CustomAgentScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SubagentMode>,
+    pub tools_policy: CustomAgentToolsPolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct CustomAgentErrorInfo {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 /// Response payload for `Op::ListSkills`.
