@@ -28,6 +28,8 @@ use codex_tui::update_action::UpdateAction;
 use codex_tui2 as tui2;
 use owo_colors::OwoColorize;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 use supports_color::Stream;
 
 mod mcp_cmd;
@@ -36,6 +38,9 @@ mod wsl_paths;
 
 use crate::mcp_cmd::McpCli;
 
+use codex_core::AuthManager;
+use codex_core::ConversationManager;
+use codex_core::NewConversation;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::find_codex_home;
@@ -44,6 +49,12 @@ use codex_core::features::Feature;
 use codex_core::features::FeatureOverrides;
 use codex_core::features::Features;
 use codex_core::features::is_known_feature_key;
+use codex_core::protocol::AgentMessageEvent;
+use codex_core::protocol::ErrorEvent;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::Op;
+use codex_core::protocol::SessionSource;
+use codex_core::protocol::WarningEvent;
 
 /// Codex CLI
 ///
@@ -79,6 +90,12 @@ enum Subcommand {
     /// Run Codex non-interactively.
     #[clap(visible_alias = "e")]
     Exec(ExecCli),
+
+    /// [experimental] Create a multi-agent plan using background subagents.
+    Plan(OrchestrateCommand),
+
+    /// [experimental] Solve a task using background subagents.
+    Solve(OrchestrateCommand),
 
     /// Run a code review non-interactively.
     Review(ReviewArgs),
@@ -130,6 +147,38 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+}
+
+#[derive(Debug, Parser)]
+struct OrchestrateCommand {
+    /// The task goal.
+    #[arg(value_name = "TASK", value_hint = clap::ValueHint::Other)]
+    task: String,
+
+    /// Time to wait for the orchestration result before exiting with an error.
+    #[arg(long = "timeout-ms", default_value_t = 10 * 60 * 1000)]
+    timeout_ms: u64,
+
+    #[clap(flatten)]
+    config_overrides: CliConfigOverrides,
+
+    /// Model the agent should use.
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+
+    /// Tell the agent to use the specified directory as its working root.
+    #[clap(long = "cd", short = 'C', value_name = "DIR")]
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OrchestrateKind {
+    Plan,
+    Solve,
 }
 
 #[derive(Debug, Parser)]
@@ -460,6 +509,20 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             );
             codex_exec::run_main(exec_cli, codex_linux_sandbox_exe).await?;
         }
+        Some(Subcommand::Plan(mut plan_cli)) => {
+            prepend_config_flags(
+                &mut plan_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_orchestrate(OrchestrateKind::Plan, plan_cli).await?;
+        }
+        Some(Subcommand::Solve(mut solve_cli)) => {
+            prepend_config_flags(
+                &mut solve_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_orchestrate(OrchestrateKind::Solve, solve_cli).await?;
+        }
         Some(Subcommand::Review(review_args)) => {
             let mut exec_cli = ExecCli::try_parse_from(["codex", "exec"])?;
             exec_cli.command = Some(ExecCommand::Review(review_args));
@@ -642,6 +705,82 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
         },
     }
 
+    Ok(())
+}
+
+async fn run_orchestrate(kind: OrchestrateKind, cmd: OrchestrateCommand) -> anyhow::Result<()> {
+    let mut cli_kv_overrides = cmd
+        .config_overrides
+        .parse_overrides()
+        .map_err(anyhow::Error::msg)?;
+
+    if let Some(model) = cmd.model {
+        cli_kv_overrides.push(("model".to_string(), toml::Value::String(model)));
+    }
+    if let Some(cwd) = cmd.cwd {
+        cli_kv_overrides.push((
+            "cwd".to_string(),
+            toml::Value::String(cwd.to_string_lossy().to_string()),
+        ));
+    }
+
+    // Orchestration commands require subagents.
+    cli_kv_overrides.push(("features.subagents".to_string(), toml::Value::Boolean(true)));
+
+    let overrides = ConfigOverrides {
+        config_profile: cmd.config_profile,
+        ..Default::default()
+    };
+    let mut config = Config::load_with_cli_overrides(cli_kv_overrides, overrides).await?;
+    config.features.enable(Feature::Subagents);
+
+    // Avoid update prompts / UI-only flows in non-interactive mode.
+    config.check_for_update_on_startup = false;
+
+    let auth_manager = AuthManager::shared(
+        config.codex_home.clone(),
+        false,
+        config.cli_auth_credentials_store_mode,
+    );
+    let server = Arc::new(ConversationManager::new(auth_manager, SessionSource::Cli));
+    let NewConversation { conversation, .. } = server.new_conversation(config).await?;
+
+    let op = match kind {
+        OrchestrateKind::Plan => Op::OrchestratePlan {
+            prompt: cmd.task.clone(),
+        },
+        OrchestrateKind::Solve => Op::OrchestrateSolve {
+            prompt: cmd.task.clone(),
+        },
+    };
+    let op_id = conversation.submit(op).await?;
+
+    let timeout = Duration::from_millis(cmd.timeout_ms);
+    tokio::time::timeout(timeout, async {
+        loop {
+            let event = conversation.next_event().await?;
+            if event.id != op_id {
+                continue;
+            }
+            match event.msg {
+                EventMsg::Warning(WarningEvent { message }) => {
+                    eprintln!("{message}\n");
+                }
+                EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                    println!("{message}");
+                    break;
+                }
+                EventMsg::Error(ErrorEvent { message, .. }) => {
+                    return Err(anyhow::anyhow!("{message}"));
+                }
+                _ => {}
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await??;
+
+    let _ = conversation.submit(Op::Shutdown).await;
     Ok(())
 }
 
